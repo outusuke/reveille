@@ -57,7 +57,7 @@ class RoundTrip(Base):
         self.assertEqual(m["trigger"]["days"], ["Mon", "Fri"])
         self.assertEqual((m["trigger"]["hour"], m["trigger"]["minute"]), (7, 30))
         self.assertEqual(m["adv"], {"cwd": "/tmp", "env": "A=1 'B=x y'", "timeout": 5, "ac": True,
-                                    "online": True, "delay": 60})
+                                    "online": True, "delay": 60, "retries": 0, "retry_wait": 5, "low": False, "path": "", "then": ""})
         self.assertIn("echo $HOME | cat", m["command"])
 
     def test_percent_and_dollar_are_escaped_in_the_files(self):
@@ -188,7 +188,7 @@ class Editable(Base):
             self.assertIn(line, svc)
         write("x.service", svc)
         s2 = rv.parse_service("x.service")
-        self.assertEqual(s2["adv"], {"cwd": "/tmp", "env": "A=1", "timeout": 5, "ac": True, "online": True})
+        self.assertEqual(s2["adv"], {"cwd": "/tmp", "env": "A=1", "timeout": 5, "ac": True, "online": True, "retries": 0, "retry_wait": 5, "low": False, "path": "", "then": ""})
         svc3, _ = self.save(m, adv={"cwd": "", "env": "", "timeout": 0, "ac": False, "online": False, "delay": 0})
         self.assertEqual(svc3, GPODDER_SERVICE)
 
@@ -198,11 +198,11 @@ class Editable(Base):
         self.assertIn("Description=Podcasts", svc); self.assertIn("Description=Podcasts", tim)
 
     def test_foreign_dependencies_and_conditions_are_kept(self):
-        svc = SIMPLE_SERVICE.replace("[Service]", "After=mnt-data.mount network-online.target\nConditionPathExists=/x\n\n[Service]")
+        svc = SIMPLE_SERVICE.replace("[Service]", "After=mnt-data.mount network-online.target\nConditionFileNotEmpty=/x\n\n[Service]")
         m = self.load(svc)
         out, _ = self.save(m, adv={"cwd": "", "env": "", "timeout": 0, "ac": False, "online": False, "delay": 0})
         self.assertIn("After=mnt-data.mount network-online.target", out)
-        self.assertIn("ConditionPathExists=/x", out)
+        self.assertIn("ConditionFileNotEmpty=/x", out)
 
     def test_comments_and_continuation_lines(self):
         svc = ("[Unit]\nDescription=x\n# keep me\n\n[Service]\nType=oneshot\n"
@@ -648,6 +648,326 @@ class SetTimer(unittest.TestCase):
     def test_failure_is_reported(self):
         self.machine(enable_ok=False, start_ok=False)
         self.assertEqual(rv.set_timer("x.timer", True), "boom")
+
+
+class PickList(unittest.TestCase):
+    def test_listed_value_is_selected_in_place(self):
+        self.assertEqual(rv.pick_list(["a", "b", "c"], "b"), (["a", "b", "c"], 1))
+
+    def test_missing_value_is_kept_not_replaced_by_the_first_item(self):
+        # an uninstalled app must not turn into the first app on save
+        items, i = rv.pick_list(["a.desktop", "b.desktop"], "gone.desktop")
+        self.assertEqual((items[i], len(items)), ("gone.desktop", 3))
+
+    def test_no_current_value_selects_first(self):
+        self.assertEqual(rv.pick_list(["a", "b"], None), (["a", "b"], 0))
+        self.assertEqual(rv.pick_list([], None), ([], 0))
+
+    def test_input_list_is_not_modified(self):
+        src = ["a"]; rv.pick_list(src, "zzz"); self.assertEqual(src, ["a"])
+
+
+class BadCalendar(unittest.TestCase):
+    def setUp(self): self._sh = rv.sh
+    def tearDown(self): rv.sh = self._sh
+
+    def test_empty_is_bad(self):
+        self.assertTrue(rv.bad_calendar("")); self.assertTrue(rv.bad_calendar(" | "))
+
+    def test_every_part_is_checked(self):
+        seen = []
+        def fake(*a, **k):
+            seen.append(a[2]); return Proc(returncode=1 if a[2] == "nonsense" else 0)
+        rv.sh = fake
+        self.assertFalse(rv.bad_calendar("Mon 09:00 | Fri 10:00")); self.assertEqual(seen, ["Mon 09:00", "Fri 10:00"])
+        self.assertTrue(rv.bad_calendar("Mon 09:00 | nonsense"))
+
+    def test_missing_or_slow_analyzer_does_not_crash_or_reject(self):
+        rv.sh = lambda *a, **k: None
+        self.assertFalse(rv.bad_calendar("Mon 09:00"))
+
+
+class StartService(Base):
+    def test_success_and_failure(self):
+        self.assertIsNone(rv.start_service("x.service"))
+        self.assertIn(("start", "--no-block", "x.service"), CALLS)
+        old = rv.ctl
+        rv.ctl = lambda *a: Proc(stderr="Unit x.service not found.\n", returncode=5)
+        try: self.assertEqual(rv.start_service("x.service"), "Unit x.service not found.")
+        finally: rv.ctl = old
+
+    def test_start_now_still_works_with_a_task(self):
+        self.assertIsNone(rv.start_now({"service": "y.service"})); self.assertIn(("start", "--no-block", "y.service"), CALLS)
+
+
+class FindRunnable(unittest.TestCase):
+    DATA = {"tasks": [{"unit": "nightly", "timer": "nightly.timer", "name": "Nightly Backup", "service": "nightly.service"}],
+            "free": ["orphan.service"]}
+
+    def test_matches_unit_timer_name_and_service_case_insensitively(self):
+        for n in ("nightly", "NIGHTLY.timer", "nightly backup", "nightly.service"):
+            self.assertEqual(rv.find_runnable(n, self.DATA), ("nightly.service", None))
+
+    def test_services_without_a_timer(self):
+        self.assertEqual(rv.find_runnable("orphan", self.DATA), ("orphan.service", None))
+        self.assertEqual(rv.find_runnable("orphan.service", self.DATA), ("orphan.service", None))
+
+    def test_unknown_name_gives_a_hint(self):
+        svc, err = rv.find_runnable("nope", self.DATA)
+        self.assertIsNone(svc); self.assertIn("reveille list", err)
+
+
+class CommandLine(Base):
+    def setUp(self):
+        super().setUp(); self._gather, self._gui = rv.gather, rv.gui
+        rv.gui = lambda: "gui opened"
+
+    def tearDown(self): rv.gather, rv.gui = self._gather, self._gui
+
+    def run_main(self, *argv):
+        import contextlib, io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try: code = rv.main(list(argv))
+            except SystemExit as e: code = e.code
+        return code, out.getvalue(), err.getvalue()
+
+    def test_version_and_help_do_not_open_the_window(self):
+        code, out, _ = self.run_main("--version"); self.assertEqual(code, 0); self.assertIn(rv.VERSION, out)
+        code, out, _ = self.run_main("--help"); self.assertEqual(code, 0); self.assertIn("list", out)
+
+    def test_unknown_argument_is_an_error_not_a_window(self):
+        for argv in (["--bogus"], ["bogus"], ["run"]):
+            code, _, err = self.run_main(*argv); self.assertEqual(code, 2); self.assertIn("usage", err)
+
+    def test_no_arguments_opens_the_window(self):
+        import sys, types
+        fake = types.SimpleNamespace(require_version=lambda *a: None)
+        old = sys.modules.get("gi"); sys.modules["gi"] = fake
+        try: self.assertEqual(rv.main([]), "gui opened")
+        finally:
+            if old is None: del sys.modules["gi"]
+            else: sys.modules["gi"] = old
+
+    def test_missing_gtk_gives_a_message_not_a_traceback(self):
+        import sys
+        old = sys.modules.get("gi"); sys.modules["gi"] = None          # makes "import gi" raise ImportError
+        try: code, _, err = self.run_main()
+        finally:
+            if old is None: del sys.modules["gi"]
+            else: sys.modules["gi"] = old
+        self.assertEqual(code, 1); self.assertIn("PyGObject", err); self.assertIn("--help", err)
+
+    def test_list_prints_tasks_or_says_there_are_none(self):
+        rv.gather = lambda: {"tasks": [], "free": []}
+        self.assertEqual(self.run_main("list")[:2], (0, "No tasks\n"))
+        m = {"unit": "nightly", "name": "Nightly", "trigger": {**rv.DEFAULT_TR}, "enabled": True, "fstate": "enabled",
+             "next_text": "tomorrow 03:00", "next": "", "last": None, "last_text": "", "running": False,
+             "timer": "nightly.timer", "service": "nightly.service"}
+        rv.gather = lambda: {"tasks": [m], "free": []}
+        code, out, _ = self.run_main("list")
+        self.assertEqual(code, 0); self.assertIn("nightly: Nightly", out); self.assertIn("tomorrow 03:00", out)
+
+    def test_run_starts_the_service_and_reports_unknown_names(self):
+        m = {"unit": "nightly", "name": "Nightly", "timer": "nightly.timer", "service": "nightly.service"}
+        rv.gather = lambda: {"tasks": [m], "free": []}
+        code, out, _ = self.run_main("run", "nightly")
+        self.assertEqual(code, 0); self.assertIn("Started nightly.service", out); self.assertIn(("start", "--no-block", "nightly.service"), CALLS)
+        code, _, err = self.run_main("run", "nope"); self.assertEqual(code, 1); self.assertIn("No task or service", err)
+
+    def test_run_reports_a_failed_start(self):
+        rv.gather = lambda: {"tasks": [], "free": ["x.service"]}
+        old = rv.ctl; rv.ctl = lambda *a: Proc(stderr="denied", returncode=1)
+        try: code, _, err = self.run_main("run", "x")
+        finally: rv.ctl = old
+        self.assertEqual(code, 1); self.assertIn("denied", err)
+
+
+def adv(**kw):
+    return {"cwd": "", "env": "", "timeout": 0, "ac": False, "online": False, "delay": 0, **kw}
+
+
+class Reliability(Base):
+    """Retry on failure, low priority, a path condition and "then run", written to and read back from units."""
+
+    def roundtrip(self, **kw):
+        t = task(adv=adv(**kw)); self.assertIsNone(rv.apply_task(t))
+        return rv.load_task(f"{t['unit']}.timer"), read(f"{rv.UNITS}/{t['unit']}.service")
+
+    def test_retry_window_covers_every_try(self):
+        self.assertEqual(rv.retry_window(3, 5), 4 * (5 + 60) * 60 + 60)          # a run is assumed to take an hour
+        self.assertEqual(rv.retry_window(2, 10, 20), 3 * (10 + 20) * 60 + 60)    # a timeout bounds a run
+        self.assertGreater(rv.retry_window(1, 1), 2 * 60)
+
+    def test_retry_is_written_as_restart_on_failure_with_a_matching_limit(self):
+        m, svc = self.roundtrip(retries=3, retry_wait=10, timeout=20)
+        for line in ("Restart=on-failure", "RestartSec=10min", "StartLimitBurst=4",
+                     f"StartLimitIntervalSec={rv.retry_window(3, 10, 20)}", "TimeoutStartSec=20min"):
+            self.assertIn(line, svc)
+        self.assertTrue(m["full"]); self.assertEqual((m["adv"]["retries"], m["adv"]["retry_wait"]), (3, 10))
+
+    def test_no_retries_writes_nothing(self):
+        m, svc = self.roundtrip(retries=0, retry_wait=7)
+        for key in ("Restart", "StartLimit", "Nice", "IOScheduling", "OnSuccess", "ConditionPath"): self.assertNotIn(key, svc)
+        self.assertEqual(m["adv"]["retries"], 0)
+
+    def test_turning_retries_off_removes_the_lines(self):
+        t = task(adv=adv(retries=2)); rv.apply_task(t)
+        rv.apply_task({**t, "old_name": t["name"], "keep_exec": True, "adv": adv(retries=0)})
+        svc = read(f"{rv.UNITS}/{t['unit']}.service")
+        for key in ("Restart", "StartLimit"): self.assertNotIn(key, svc)
+
+    def test_low_priority_round_trip(self):
+        m, svc = self.roundtrip(low=True)
+        self.assertIn("Nice=19", svc); self.assertIn("IOSchedulingClass=idle", svc); self.assertTrue(m["adv"]["low"])
+        self.assertFalse(self.roundtrip(low=False)[0]["adv"]["low"])
+
+    def test_a_foreign_nice_value_survives_unless_low_priority_is_on(self):
+        svc = SIMPLE_SERVICE + "Nice=5\nIOSchedulingClass=best-effort\n"
+        write("x.service", svc); write("x.timer", SIMPLE_TIMER)
+        m = rv.load_task("x.timer"); self.assertTrue(m["full"]); self.assertFalse(m["adv"]["low"])
+        base = {"name": "x", "kind": "command", "command": "/usr/bin/true", "trigger": rv.DEFAULT_TR, "service": "x.service",
+                "unit": "x", "old_name": "x", "keep_exec": True}
+        out, _ = rv.unit_texts({**base, "adv": adv(low=False)}, svc, SIMPLE_TIMER)
+        self.assertIn("Nice=5", out); self.assertIn("IOSchedulingClass=best-effort", out)
+        out, _ = rv.unit_texts({**base, "adv": adv(low=True)}, svc, SIMPLE_TIMER)
+        self.assertNotIn("Nice=5", out); self.assertEqual(out.count("Nice="), 1); self.assertIn("Nice=19", out)
+
+    def test_path_condition_round_trip_including_inversion_and_percent(self):
+        for path in ("/mnt/data", "!/tmp/skip", "/srv/100%"):
+            m, svc = self.roundtrip(path=path)
+            self.assertEqual(m["adv"]["path"], path)
+        self.assertIn("ConditionPathExists=/srv/100%%", svc)            # % is escaped in the file
+
+    def test_then_run_round_trip_and_clearing(self):
+        m, svc = self.roundtrip(then="upload.service")
+        self.assertIn("OnSuccess=upload.service", svc); self.assertEqual(m["adv"]["then"], "upload.service")
+        self.assertEqual(self.roundtrip(then="")[0]["adv"]["then"], "")
+
+    def test_everything_together_and_other_lines_survive(self):
+        t = task(adv=adv(retries=1, retry_wait=2, low=True, path="/x", then="b.service", ac=True))
+        rv.apply_task(t)
+        path = f"{rv.UNITS}/{t['unit']}.service"
+        with open(path, "a") as f: f.write("")
+        text = read(path).replace("[Unit]\n", "[Unit]\nSuccessAction=none\n")
+        write(f"{t['unit']}.service", text)
+        rv.apply_task({**t, "old_name": t["name"], "keep_exec": True})
+        out = read(path); self.assertIn("SuccessAction=none", out)
+        m = rv.load_task(f"{t['unit']}.timer")
+        self.assertEqual((m["adv"]["retries"], m["adv"]["low"], m["adv"]["path"], m["adv"]["then"], m["adv"]["ac"]),
+                         (1, True, "/x", "b.service", True))
+
+
+class Representable(Base):
+    def why(self, extra_unit="", extra_service=""):
+        text = (f"[Unit]\nDescription=x\n{extra_unit}\n[Service]\nType=oneshot\nExecStart=/usr/bin/true\n{extra_service}")
+        write("x.service", text); return rv.parse_service("x.service").get("why", "")
+
+    def test_what_the_editor_cannot_show_limits_the_task(self):
+        self.assertIn("Restart=", self.why(extra_service="Restart=always\n"))
+        self.assertIn("StartLimitBurst", self.why(extra_service="Restart=on-failure\nRestartSec=5min\n"))
+        self.assertIn("StartLimitBurst", self.why("StartLimitBurst=99\n", "Restart=on-failure\nRestartSec=5min\n"))
+        self.assertIn("RestartSec", self.why("StartLimitBurst=3\n", "Restart=on-failure\nRestartSec=30s\n"))
+        self.assertIn("RestartSec", self.why("StartLimitBurst=3\n", "Restart=on-failure\n"))
+        self.assertIn("ConditionPathExists", self.why("ConditionPathExists=/a\nConditionPathExists=/b\n"))
+        self.assertIn("OnSuccess", self.why("OnSuccess=a.service b.service\n"))
+        self.assertIn("OnSuccess", self.why("OnSuccess=a.service\nOnSuccess=b.service\n"))
+
+    def test_what_it_can_show_is_not_limited(self):
+        self.assertEqual(self.why(extra_service="Restart=no\nNice=10\n"), "")
+        self.assertEqual(self.why("StartLimitBurst=4\n", "Restart=on-failure\nRestartSec=15min\n"), "")
+        self.assertEqual(self.why("OnSuccess=a.service\nConditionPathExists=!/skip\n"), "")
+
+    def test_burst_maps_to_retries(self):
+        write("x.service", "[Unit]\nStartLimitBurst=4\n[Service]\nExecStart=/usr/bin/true\nRestart=on-failure\nRestartSec=15min\n")
+        a = rv.parse_service("x.service")["adv"]; self.assertEqual((a["retries"], a["retry_wait"]), (3, 15))
+
+
+class ThenCycle(Base):
+    def link(self, name, then=""):
+        write(name, "[Unit]\n" + (f"OnSuccess={then}\n" if then else "") + "[Service]\nExecStart=/usr/bin/true\n")
+
+    def test_a_task_cannot_run_itself(self):
+        self.assertTrue(rv.then_cycle("a.service", "a.service"))
+
+    def test_loops_of_any_length_are_found(self):
+        self.link("b.service", "a.service"); self.assertTrue(rv.then_cycle("a.service", "b.service"))
+        self.link("c.service", "b.service"); self.assertTrue(rv.then_cycle("a.service", "c.service"))
+
+    def test_a_chain_without_a_loop_is_fine(self):
+        self.link("b.service", "c.service"); self.link("c.service")
+        self.assertFalse(rv.then_cycle("a.service", "b.service"))
+
+    def test_an_existing_loop_elsewhere_does_not_hang(self):
+        self.link("b.service", "c.service"); self.link("c.service", "b.service")
+        self.assertFalse(rv.then_cycle("a.service", "b.service"))
+
+    def test_unreadable_or_empty_targets(self):
+        self.assertFalse(rv.then_cycle("a.service", "missing.service")); self.assertFalse(rv.then_cycle("a.service", ""))
+
+
+class SystemdVersion(unittest.TestCase):
+    def setUp(self): self._sh = rv.sh; rv._CACHE.clear()
+    def tearDown(self): rv.sh = self._sh; rv._CACHE.clear()
+
+    def test_parsed_and_asked_only_once(self):
+        calls = []
+        rv.sh = lambda *a, **k: calls.append(a) or Proc(stdout="systemd 255 (255.4-1ubuntu8)\n+PAM +AUDIT\n")
+        self.assertEqual(rv.systemd_version(), 255); self.assertEqual(rv.systemd_version(), 255); self.assertEqual(len(calls), 1)
+
+    def test_unknown_when_it_cannot_be_asked(self):
+        rv.sh = lambda *a, **k: None; self.assertIsNone(rv.systemd_version())
+        rv._CACHE.clear(); rv.sh = lambda *a, **k: Proc(stdout="garbage"); self.assertIsNone(rv.systemd_version())
+
+
+class RowText(unittest.TestCase):
+    M = {"trigger": {**rv.DEFAULT_TR}, "enabled": True, "fstate": "enabled", "next_text": "tomorrow 03:00", "next": "",
+         "last": {"time": "x", "rc": 1}, "last_text": "5 min ago", "running": False}
+
+    def test_waiting_to_retry_is_shown_instead_of_running(self):
+        sub, _ = rv.task_texts({**self.M, "retrying": True, "running": False})
+        self.assertIn("Waiting to retry", sub); self.assertNotIn("Running now", sub)
+        sub, _ = rv.task_texts({**self.M, "retrying": False, "running": True}); self.assertIn("Running now", sub)
+
+    def test_rows_without_the_flag_still_work(self):
+        self.assertIn("failed (1)", rv.task_texts(self.M)[0])
+
+
+class FollowLogTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(); self._path = os.environ["PATH"]
+        os.environ["PATH"] = self.dir + os.pathsep + self._path
+    def tearDown(self):
+        os.environ["PATH"] = self._path; shutil.rmtree(self.dir, ignore_errors=True)
+
+    def fake_journalctl(self, body):
+        path = os.path.join(self.dir, "journalctl")
+        with open(path, "w") as f: f.write("#!/bin/sh\n" + body)
+        os.chmod(path, 0o755)
+
+    def wait_for(self, got, n, timeout=5):
+        end = time.time() + timeout
+        while len(got) < n and time.time() < end: time.sleep(0.02)
+
+    def test_lines_arrive_as_they_are_written_and_stop_ends_the_follow(self):
+        self.fake_journalctl('echo "$@"\necho "-- No entries --"\necho one\necho two\nexec sleep 30\n')
+        got = []; f = rv.FollowLog("x.service", got.append, lines=50)
+        self.assertIsNone(f.start()); self.wait_for(got, 3)
+        self.assertEqual(got[1:], ["one", "two"])                        # "-- ..." status lines are dropped
+        for arg in ("--user", "--unit=x.service", "-f", "-n", "50"): self.assertIn(arg, got[0].split())
+        f.stop(); end = time.time() + 5
+        while f.proc.poll() is None and time.time() < end: time.sleep(0.02)
+        self.assertIsNotNone(f.proc.poll())                              # the process was ended, not left running
+
+    def test_nothing_is_delivered_after_stop(self):
+        self.fake_journalctl("trap '' TERM\necho first\nsleep 0.3\necho late\n")      # keeps running after stop()
+        got = []; f = rv.FollowLog("x.service", got.append)
+        f.start(); self.wait_for(got, 1); f.stop(); time.sleep(0.6)
+        self.assertEqual(got, ["first"])
+
+    def test_missing_journalctl_is_an_error_text_not_a_crash(self):
+        os.environ["PATH"] = self.dir                                    # an empty folder: no journalctl anywhere
+        self.assertEqual(rv.FollowLog("x.service", lambda l: None).start(), "journalctl is not available")
 
 
 if __name__ == "__main__":

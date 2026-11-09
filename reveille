@@ -8,8 +8,13 @@ in ~/.config/systemd/user. Nothing else is kept on disk, and the timers never ca
   reveille install      add it to the app menu (copies itself to ~/.local/share/reveille)
   reveille uninstall    remove it from the app menu
   reveille services     list what the service picker finds (for troubleshooting)
+  reveille list         print every task with its schedule, next run and last result
+  reveille run NAME     run a task or service now
+  reveille --version
 """
-import datetime, os, re, shlex, shutil, subprocess, sys, tempfile, threading, time
+import argparse, datetime, os, re, shlex, shutil, subprocess, sys, tempfile, threading, time
+
+VERSION = "0.1.0"
 
 HOME = os.path.expanduser("~")
 CONF = os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config")
@@ -363,14 +368,50 @@ def parse_service(name):
     for v in sv.get("Environment", []):
         try: env += [unesc(x) for x in shlex.split(v)]
         except ValueError: return {"why": "Environment= has an unclosed quote"}
+    retries, wait = 0, 5
+    mode = sv.get("Restart", ["no"])[-1]
+    if mode not in ("no", "on-failure"): return {"why": "Restart= is something other than on-failure"}
+    if mode == "on-failure":
+        burst = (un.get("StartLimitBurst") or [""])[-1]
+        if not re.fullmatch(r"\d+", burst) or not 2 <= int(burst) <= 11:
+            return {"why": "Restart=on-failure has no StartLimitBurst= between 2 and 11"}
+        retries = int(burst) - 1
+        m = re.fullmatch(r"([1-9]\d*)min", (sv.get("RestartSec") or [""])[-1])
+        if not m or int(m[1]) > 1440: return {"why": "RestartSec= isn't a whole number of minutes (1 to 1440)"}
+        wait = int(m[1])
+    paths = un.get("ConditionPathExists", [])
+    if len(paths) > 1: return {"why": "there are several ConditionPathExists= lines"}
+    then = [x for v in un.get("OnSuccess", []) for x in v.split()]
+    if len(then) > 1: return {"why": "OnSuccess= lists more than one unit"}
     adv = {"cwd": unesc(sv.get("WorkingDirectory", [""])[-1]), "env": " ".join(shlex.quote(x) for x in env),
-           "timeout": timeout, "ac": "true" in un.get("ConditionACPower", []), "online": ONLINE in deps}
+           "timeout": timeout, "ac": "true" in un.get("ConditionACPower", []), "online": ONLINE in deps,
+           "retries": retries, "retry_wait": wait,
+           "low": sv.get("Nice") == ["19"] and sv.get("IOSchedulingClass") == ["idle"],
+           "path": unesc(paths[0]) if paths else "", "then": then[0] if then else ""}
     s = {"adv": adv, "kind": "command", "command": cmd}
     if len(tokens) == 3 and os.path.basename(tokens[0]) == "gio" and tokens[1] == "launch":
         s.update(kind="app", app=os.path.basename(tokens[2]))
     elif len(tokens) == 2 and os.path.basename(tokens[0]) == "gtk-launch":
         s.update(kind="app", app=tokens[1] if tokens[1].endswith(".desktop") else tokens[1] + ".desktop")
     return s
+
+def retry_window(retries, wait_min, timeout_min=0):
+    """Seconds of systemd's start-limit window for a task that retries `retries` times. It has to be long enough
+    to hold every try, or the count is never reached and a failing task would retry forever. How long a run takes
+    is only known when there is a timeout, so one hour is assumed otherwise."""
+    return (retries + 1) * (wait_min + (timeout_min or 60)) * 60 + 60
+
+def then_cycle(service, then):
+    """True if starting `then` after `service` succeeds would lead back to `service` through OnSuccess= links."""
+    seen, todo = set(), [then]
+    while todo:
+        cur = todo.pop()
+        if cur == service: return True
+        if cur in seen or not cur: continue
+        seen.add(cur)
+        u = read_unit(unit_path(cur)) or {}
+        todo += [x for v in u.get("Unit", {}).get("OnSuccess", []) for x in v.split()]
+    return False
 
 def load_task(timer, status=None):
     """Build a task from a timer file (and the service it starts). "full" means the editor can rewrite it."""
@@ -460,21 +501,34 @@ def unit_texts(t, old_service="", old_timer=""):
         unit = [f"Description={esc(name)}"] if desc else []
         if adv.get("ac"): unit.append("ConditionACPower=true")
         if adv.get("online"): unit += [f"Wants={ONLINE}", f"After={ONLINE}"]
+        if adv.get("path"): unit.append(f"ConditionPathExists={esc(adv['path'])}")
+        if adv.get("then"): unit.append(f"OnSuccess={adv['then']}")
+        retries = int(adv.get("retries") or 0)
+        wait = max(1, int(adv.get("retry_wait") or 5))
+        if retries: unit += [f"StartLimitIntervalSec={retry_window(retries, wait, adv.get('timeout') or 0)}",
+                             f"StartLimitBurst={retries + 1}"]
+        low = bool(adv.get("low"))
         svc = [] if old_service else ["Type=oneshot"]
         if adv.get("cwd"): svc.append(f"WorkingDirectory={esc(adv['cwd'])}")
         for kv in shlex.split(adv.get("env", "")): svc.append(f"Environment={shlex.quote(esc(kv))}")   # no $ expansion here
         if adv.get("timeout"): svc.append(f"TimeoutStartSec={int(adv['timeout'])}min")
+        if retries: svc += ["Restart=on-failure", f"RestartSec={wait}min"]
+        if low: svc += ["Nice=19", "IOSchedulingClass=idle"]
         if t["kind"] == "app": svc.append("KillMode=process")    # the launcher exits at once: don't kill the app it started
         if not keep_exec: svc.append(f"ExecStart={build_exec(t)}")
+        def keep_svc(k, v):                # a Nice= or IOSchedulingClass= that isn't the low-priority preset stays
+            return not low and ((k == "Nice" and v != "19") or (k == "IOSchedulingClass" and v != "idle"))
         def keep_unit(k, v):               # keep dependencies and conditions that aren't ours
             if k == "ConditionACPower": return v != "true"
             if k in ("Wants", "After"): return set(v.split()) != {ONLINE}
             return False
         service = merge_unit(old_service, {
-            "Unit": ({"ConditionACPower", "Wants", "After"} | ({"Description"} if desc else set()), unit, keep_unit),
-            "Service": ({"WorkingDirectory", "Environment", "TimeoutStartSec"} | (set() if keep_exec else {"ExecStart"})
+            "Unit": ({"ConditionACPower", "Wants", "After", "ConditionPathExists", "OnSuccess", "StartLimitIntervalSec",
+                      "StartLimitBurst"} | ({"Description"} if desc else set()), unit, keep_unit),
+            "Service": ({"WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice",
+                         "IOSchedulingClass"} | (set() if keep_exec else {"ExecStart"})
                         | ({"KillMode"} if t["kind"] == "app" else set()),
-                        svc, never)})
+                        svc, keep_svc)})
     timer = merge_unit(old_timer, {
         "Unit": ({"Description"} if desc else set(), [f"Description={esc(name)}"] if desc else [], never),
         "Timer": (set(SCHEDULE_KEYS) | {"Unit"},
@@ -558,8 +612,31 @@ def set_timer(name, on):
         if unit_status(name)[1] != on: return err or "The timer did not change state"
     return None
 
+def start_service(service):
+    """Queue a service to run now. Returns an error text or None."""
+    r = ctl("start", "--no-block", service)
+    return (r.stderr.strip() or "systemctl failed") if r.returncode else None
+
 def start_now(m):
-    ctl("start", "--no-block", m["service"])
+    return start_service(m["service"])
+
+def bad_calendar(expr):
+    """True if `expr` (one or several calendar expressions separated by |) is empty or rejected by
+    systemd-analyze. If systemd-analyze is missing or too slow nothing can be checked, so it is not rejected."""
+    parts = calendar_parts(expr)
+    if not parts: return True
+    for p in parts:
+        r = sh("systemd-analyze", "calendar", p, timeout=5)
+        if r is not None and r.returncode: return True
+    return False
+
+def pick_list(items, current):
+    """(items, index) for a picker. A current value the list doesn't offer (an uninstalled app, a hidden
+    service) is added at the top and selected, so saving without touching it can't silently switch it."""
+    items = list(items)
+    if current and current in items: return items, items.index(current)
+    if current: items.insert(0, current); return items, 0
+    return items, 0
 
 
 def sh(*cmd, timeout=10):
@@ -592,6 +669,45 @@ def read_log(service, lines=200):
     text = r.stdout.strip()
     return (text, None) if text and not text.startswith("-- No entries") else (LOG_HINT.format(unit=service), None)
 
+_CACHE = {}
+
+def systemd_version():
+    """The running systemd's major version (255, say), or None if it can't be told. Asked once."""
+    if "v" not in _CACHE:
+        r = sh("systemctl", "--version", timeout=5)
+        m = re.match(r"systemd (\d+)", r.stdout) if r and r.returncode == 0 else None
+        _CACHE["v"] = int(m[1]) if m else None
+    return _CACHE["v"]
+
+class FollowLog:
+    """`journalctl -f` for a service. Lines are read in a thread and handed to on_line(text), which therefore
+    runs off the main thread. start() returns an error text or None; stop() ends the follow."""
+    def __init__(self, service, on_line, lines=200):
+        self.service, self.on_line, self.lines = service, on_line, lines
+        self.proc, self.stopped = None, False
+
+    def start(self):
+        try:
+            self.proc = subprocess.Popen(
+                ["journalctl", "--user", f"--unit={self.service}", "-n", str(int(self.lines)), "-f", "--no-pager",
+                 "-o", "short-iso"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        except OSError:
+            return "journalctl is not available"
+        threading.Thread(target=self._read, daemon=True).start()
+        return None
+
+    def _read(self):
+        proc = self.proc
+        for line in proc.stdout:
+            if self.stopped: break
+            line = line.rstrip("\n")
+            if not line.startswith("-- "): self.on_line(line)          # "-- No entries --" and friends
+        proc.stdout.close(); proc.wait()
+
+    def stop(self):
+        self.stopped = True
+        if self.proc and self.proc.poll() is None: self.proc.terminate()
+
 def task_texts(m):
     """(subtitle, tooltip) of a task row, from what gather() collected."""
     lines = [describe(m["trigger"]) if m["trigger"] else "Custom schedule"]
@@ -601,7 +717,8 @@ def task_texts(m):
     else:
         lines.append("Stopped, starts again at next login" if m["fstate"] in BOOT_OK else "Disabled")
     last, status = m["last"], []
-    if m["running"]: status.append("Running now")
+    if m.get("retrying"): status.append("Waiting to retry")
+    elif m["running"]: status.append("Running now")
     if last: status.append(f"Last: {m['last_text']} " + ("OK" if last["rc"] == 0 else f"failed ({last['rc']})"))
     if status: lines.append(" · ".join(status))
     tip = [f"Next: {m['next']}" if m["enabled"] and m["next"] else "", f"Last: {last['time']}" if last else ""]
@@ -613,7 +730,7 @@ def gather():
     timers = user_timers()
     st = show_many(timers, "ActiveState", "UnitFileState", "NextElapseUSecRealtime", "NextElapseUSecMonotonic")
     tasks = [m for m in (load_task(t, st) for t in timers) if m]
-    sv = show_many(sorted({m["service"] for m in tasks}), "ActiveState", "Result", "ExecMainStatus",
+    sv = show_many(sorted({m["service"] for m in tasks}), "ActiveState", "SubState", "Result", "ExecMainStatus",
                    "ExecMainExitTimestamp")
     now, mono = time.time(), time.monotonic()
     for m in tasks:
@@ -624,10 +741,11 @@ def gather():
         m["last"] = last_run_from(svc)
         lt = parse_ts(m["last"]["time"]) if m["last"] else None
         m["last_text"] = relative(lt, now) if lt else (m["last"] or {}).get("time", "")
-        m["running"] = svc.get("ActiveState") in ("activating", "active")
+        m["retrying"] = svc.get("SubState") == "auto-restart"          # failed, waiting for the next try
+        m["running"] = svc.get("ActiveState") in ("activating", "active") and not m["retrying"]
     tasks.sort(key=lambda m: m["name"].lower())
     return {"tasks": tasks, "free": unscheduled_services(timers), "services": list_services(),
-            "linger": linger_state()}
+            "linger": linger_state(), "systemd": systemd_version()}
 
 
 # ---------------------------------------------------------------- app menu
@@ -704,17 +822,20 @@ def gui():
             self.kind = Adw.ComboRow(title="Run", model=Gtk.StringList.new(["Application", "Command", "Service"]),
                                      selected=["app", "command", "service"].index(t["kind"]))
             g.add(self.kind)
+            names = {a.get_id(): a.get_name() for a in self.apps}
+            # an app that is no longer listed stays selectable, so saving a schedule change can't swap it
+            self.app_ids, sel = pick_list([a.get_id() for a in self.apps], t.get("app") if t["kind"] == "app" else None)
             self.app = Adw.ComboRow(title="Application", enable_search=True,
-                                    model=Gtk.StringList.new([a.get_name() for a in self.apps]))
+                                    model=Gtk.StringList.new([names.get(i, f"{i} (not installed)") for i in self.app_ids]))
             self.app.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
-            for i, a in enumerate(self.apps):
-                if a.get_id() == t.get("app"): self.app.set_selected(i)
+            self.app.set_selected(sel)
             g.add(self.app)
-            self.services = win.services or list_services()
-            self.svc = Adw.ComboRow(title="Service", subtitle=f"{len(self.services)} user services found",
+            found = win.services or list_services()
+            self.services, sel = pick_list(found, t.get("service") if t["kind"] == "service" else None)
+            self.svc = Adw.ComboRow(title="Service", subtitle=f"{len(found)} user services found",
                                     enable_search=True, model=Gtk.StringList.new(self.services))
             self.svc.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
-            if t.get("service") in self.services: self.svc.set_selected(self.services.index(t["service"]))
+            self.svc.set_selected(sel)
             for row in (self.app, self.svc):
                 def tip(r, *_):
                     it = r.get_selected_item()
@@ -764,7 +885,28 @@ def gui():
             self.delay = Adw.SpinRow.new_with_range(0, 86400, 10)
             self.delay.set_title("Random delay (seconds)"); self.delay.set_subtitle("Spreads runs out so many tasks don't start at once")
             self.delay.set_value(adv.get("delay", 0))
-            self.own_only = [self.cwd, self.env, self.timeout, self.ac, self.online]   # don't apply to an existing service
+            sd = win.sdver                                  # systemd's version, to grey out what it can't do
+            self.retries = Adw.SpinRow.new_with_range(0, 10, 1); self.retries.set_title("Retry on failure")
+            self.retries.set_subtitle("How many times to try again; 0 means never"); self.retries.set_value(adv.get("retries", 0))
+            self.retry_wait = Adw.SpinRow.new_with_range(1, 1440, 1); self.retry_wait.set_title("Wait between tries (minutes)")
+            self.retry_wait.set_value(adv.get("retry_wait", 5))
+            self.low = Adw.SwitchRow(title="Run at low priority", active=adv.get("low", False),
+                                     subtitle="Lowest CPU and disk priority, so it doesn't slow down your work")
+            self.path = Adw.EntryRow(title="Only if this path exists (start with ! to require it missing)",
+                                     text=adv.get("path", ""))
+            cur = adv.get("then", "")
+            items, sel = pick_list([x for x in found if x != (m or {}).get("service")], cur)
+            self.then_opts = [""] + items
+            self.then = Adw.ComboRow(title="Then run", subtitle="A service to start after this one succeeds",
+                                     enable_search=True, model=Gtk.StringList.new(["None"] + items))
+            self.then.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
+            self.then.set_selected(sel + 1 if cur else 0)
+            if sd is not None and sd < 244:
+                self.retries.set_sensitive(False); self.retries.set_subtitle(f"Needs systemd 244 or newer (this is {sd})")
+            if sd is not None and sd < 249:
+                self.then.set_sensitive(False); self.then.set_subtitle(f"Needs systemd 249 or newer (this is {sd})")
+            self.own_only = [self.cwd, self.env, self.timeout, self.ac, self.online, self.retries, self.retry_wait,
+                             self.low, self.path, self.then]   # don't apply to an existing service
             for r in self.own_only + [self.delay]: g.add(r)
 
             # Delete lives inside the item: a task's timer, or a service without a timer opened via its row
@@ -784,7 +926,7 @@ def gui():
 
             for w in (self.kind, self.trig, self.unit, self.svc):
                 w.connect("notify::selected", self.refresh)
-            for w in (self.hour, self.minute, self.dom, self.every):
+            for w in (self.hour, self.minute, self.dom, self.every, self.retries):
                 w.connect("notify::value", self.refresh)
             self.refresh()
 
@@ -799,6 +941,7 @@ def gui():
             k = self.kind.get_selected()
             self.app.set_visible(k == 0); self.cmd.set_visible(k == 1); self.svc.set_visible(k == 2)
             for r in self.own_only: r.set_visible(k != 2)
+            self.retry_wait.set_visible(k != 2 and self.retries.get_value() > 0)
             if not self.full:                              # only the schedule of a hand-written timer is editable
                 for r in (self.name, self.kind, self.app, self.cmd, self.svc, self.enabled, *self.own_only, *self.own_groups):
                     r.set_visible(False)
@@ -825,15 +968,12 @@ def gui():
 
         def save(self):
             name, tr = self.name.get_text().strip(), self.trigger()
-            if tr["type"] == "custom" and (not calendar_parts(tr["expr"]) or any(
-                    subprocess.run(["systemd-analyze", "calendar", p], capture_output=True).returncode
-                    for p in calendar_parts(tr["expr"]))):
+            if tr["type"] == "custom" and not calendar_parts(tr["expr"]):
                 return self.win.toast("That is not a valid calendar expression")
             if tr["type"] == "weekly" and not tr["days"]: return self.win.toast("Pick at least one day")
             if not self.full:
-                err = rewrite_timer(self.m["timer"], tr, self.catchup.get_active(), int(self.delay.get_value()))
-                self.close(); self.win.fill()
-                return self.win.toast(f"Could not save: {err}" if err else "Schedule updated")
+                timer, catchup, delay = self.m["timer"], self.catchup.get_active(), int(self.delay.get_value())
+                return self.run_save("sched", tr, lambda: rewrite_timer(timer, tr, catchup, delay))
             k = self.kind.get_selected()
             if not name: return self.win.toast("Give the task a name")
             try:
@@ -844,27 +984,62 @@ def gui():
                  "catchup": self.catchup.get_active(), "enabled": self.enabled.get_active(),
                  "adv": {"cwd": self.cwd.get_text().strip(), "env": self.env.get_text().strip(),
                          "timeout": int(self.timeout.get_value()), "ac": self.ac.get_active(),
-                         "online": self.online.get_active(), "delay": int(self.delay.get_value())}}
+                         "online": self.online.get_active(), "delay": int(self.delay.get_value()),
+                         "retries": int(self.retries.get_value()), "retry_wait": int(self.retry_wait.get_value()),
+                         "low": self.low.get_active(), "path": self.path.get_text().strip(),
+                         "then": self.then_opts[self.then.get_selected()]}}
             if k == 0:
-                if not self.apps: return self.win.toast("No applications found")
-                t["app"] = self.apps[self.app.get_selected()].get_id()
+                if not self.app_ids: return self.win.toast("No applications found")
+                t["app"] = self.app_ids[self.app.get_selected()]
             elif k == 2:
                 if not self.services: return self.win.toast("No user services found")
                 t["service"] = self.services[self.svc.get_selected()]
             else:
                 t["command"] = self.cmd.get_text().strip()
+            adv = t["adv"]
+            if k != 2 and adv["retries"] and tr["type"] == "interval":      # a retry window longer than the interval
+                window = retry_window(adv["retries"], adv["retry_wait"], adv["timeout"])
+                if tr["every"] * (3600 if tr["unit"] == "h" else 60) <= window:
+                    return self.win.toast(f"Retries need a schedule longer than about {window // 60} min")
             if self.m:                              # editing in place: leave untouched what the user didn't change
                 t["old_name"] = self.m["name"]
                 same = (k == 0 and t.get("app") == self.m.get("app")) or (k == 1 and t.get("command") == self.m.get("command"))
                 t["keep_exec"] = same and ["app", "command", "service"][k] == self.m["kind"]
-            t["unit"] = self.m["unit"] if self.m else unique_base(name)
-            try:
-                err = apply_task(t)
-            except ValueError as e:
-                return self.win.toast(str(e))
-            if err and err.startswith("Could not write"): return self.win.toast(err[:120])     # nothing was saved
-            self.close(); self.win.fill()
-            self.win.toast(f"Saved, but systemd said: {err[:80]}" if err else "Task saved")
+            def job():                              # systemctl and unit-name lookups run off the main thread
+                t["unit"] = self.m["unit"] if self.m else unique_base(name)
+                if k != 2 and t["adv"]["then"] and then_cycle(t["unit"] + ".service", t["adv"]["then"]):
+                    raise ValueError("That would make tasks run each other in a loop")
+                return apply_task(t)
+            self.run_save("task", tr, job)
+
+        def run_save(self, kind, tr, job):
+            """Validate a custom schedule, then run `job` (which talks to systemd) in a thread, so the window
+            never freezes. `kind` is "sched" (schedule-only rewrite) or "task" (full write)."""
+            self.set_sensitive(False)
+            def work():
+                try:
+                    if tr["type"] == "custom" and bad_calendar(tr["expr"]): res = ("invalid", None)
+                    else: res = (kind, job())
+                except ValueError as e:
+                    res = ("error", str(e))
+                except Exception as e:                  # never leave the dialog stuck insensitive
+                    res = ("error", f"Unexpected error: {e}")
+                GLib.idle_add(self.saved, res)
+            threading.Thread(target=work, daemon=True).start()
+
+        def saved(self, res):
+            self.set_sensitive(True)
+            kind, val = res
+            if kind == "invalid": self.win.toast("That is not a valid calendar expression")
+            elif kind == "error": self.win.toast(val[:120])
+            elif kind == "sched":
+                self.close(); self.win.fill()
+                self.win.toast(f"Could not save: {val}" if val else "Schedule updated")
+            elif val and val.startswith("Could not write"): self.win.toast(val[:120])      # nothing was saved
+            else:
+                self.close(); self.win.fill()
+                self.win.toast(f"Saved, but systemd said: {val[:80]}" if val else "Task saved")
+            return False
 
         def delete(self):
             self.close(); self.win.ask_delete(self.target)
@@ -896,20 +1071,34 @@ def gui():
             tv_ = Adw.ToolbarView(content=page); tv_.add_top_bar(hb); self.set_child(tv_)
 
     class LogView(Adw.Dialog):
-        """The tail of a service's journal, read in a thread so opening it never blocks the window."""
-        def __init__(self, service):
+        """The tail of a service's journal, read in a thread so opening it never blocks the window.
+        Follow shows new lines as they arrive (journalctl -f)."""
+        MAX_LINES = 2000
+
+        def __init__(self, service, follow=False):
             super().__init__(title=f"Log: {service}", content_width=720, content_height=560)
-            self.service = service
+            self.service, self.follower, self.waiting = service, None, False
+            self._pending, self._lock, self._flushing = [], threading.Lock(), False
             self.text = Gtk.TextView(editable=False, cursor_visible=False, monospace=True,
                                      wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=8, bottom_margin=8,
                                      left_margin=10, right_margin=10)
             self.scroll = Gtk.ScrolledWindow(child=self.text, vexpand=True)
             hb = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
             close = Gtk.Button(label="Close"); close.connect("clicked", lambda *_: self.close()); hb.pack_start(close)
-            hb.pack_end(icon_btn("view-refresh-symbolic", "Reload", self.load))
+            hb.pack_end(icon_btn("view-refresh-symbolic", "Reload", self.reload))
             hb.pack_end(icon_btn("edit-copy-symbolic", "Copy the log", self.copy))
+            self.follow_btn = Gtk.ToggleButton(label="Follow", tooltip_text="Show new lines as they arrive",
+                                               valign=Gtk.Align.CENTER)
+            self.follow_btn.connect("toggled", lambda b: self.set_follow(b.get_active()))
+            hb.pack_end(self.follow_btn)
             tv = Adw.ToolbarView(content=self.scroll); tv.add_top_bar(hb); self.set_child(tv)
-            self.load()
+            self.connect("closed", lambda *_: self.stop_follow())
+            if follow: self.follow_btn.set_active(True)
+            else: self.load()
+
+        def reload(self):
+            if self.follower: self.start_follow()
+            else: self.load()
 
         def load(self):
             self.text.get_buffer().set_text("Loading…")
@@ -919,8 +1108,50 @@ def gui():
             threading.Thread(target=work, daemon=True).start()
 
         def show(self, text):
+            if self.follower: return False                 # following took over while this was loading
             self.text.get_buffer().set_text(text)
             GLib.timeout_add(100, self.to_end)             # after layout, so the newest lines are in view
+            return False
+
+        def set_follow(self, on):
+            self.stop_follow()
+            if on: self.start_follow()
+
+        def start_follow(self):
+            self.stop_follow()
+            with self._lock: self._pending, self._flushing = [], False
+            self.waiting = True
+            self.text.get_buffer().set_text("Waiting for output…")
+            f = FollowLog(self.service, self.on_line)
+            err = f.start()
+            if err:
+                self.waiting = False; self.text.get_buffer().set_text(err); self.follow_btn.set_active(False)
+            else:
+                self.follower = f
+
+        def stop_follow(self):
+            if self.follower: self.follower.stop(); self.follower = None
+
+        def on_line(self, line):                           # called from the reader thread
+            with self._lock:
+                self._pending.append(line)
+                if self._flushing: return
+                self._flushing = True
+            GLib.idle_add(self.flush)
+
+        def flush(self):
+            with self._lock:
+                lines, self._pending, self._flushing = self._pending, [], False
+            if self.follower is None or not lines: return False
+            buf, adj = self.text.get_buffer(), self.scroll.get_vadjustment()
+            at_end = adj.get_value() >= adj.get_upper() - adj.get_page_size() - 24     # only follow if already there
+            if self.waiting: buf.set_text(""); self.waiting = False
+            buf.insert(buf.get_end_iter(), "\n".join(lines) + "\n")
+            extra = buf.get_line_count() - self.MAX_LINES
+            if extra > 0:                                  # keep the buffer from growing without end
+                res = buf.get_iter_at_line(extra); it = res[1] if isinstance(res, tuple) else res
+                buf.delete(buf.get_start_iter(), it)
+            if at_end: GLib.timeout_add(50, self.to_end)
             return False
 
         def to_end(self):
@@ -967,6 +1198,7 @@ def gui():
             self.stack.add_named(empty, "empty"); self.stack.add_named(Gtk.ScrolledWindow(child=clamp), "list")
             tv.set_content(self.stack); self.overlay.set_child(tv); self.set_content(self.overlay)
             self.services, self.busy, self.again, self.shape, self.has_tasks = [], False, False, None, False
+            self.sdver = None
             self.cur, self.rows, self.syncing = {}, {}, False
             self.stack.set_visible_child_name("loading")
             self.fill()
@@ -1044,11 +1276,36 @@ def gui():
             d.connect("response", lambda _d, r: r == "delete" and self.do_delete(names))
             d.present(self)
 
+        def bg(self, fn, done=None):
+            """Run fn in a thread and hand its result (or the exception it raised) to done on the main thread."""
+            def work():
+                try: res = fn()
+                except Exception as e: res = e
+                def finish():
+                    if done: done(res)
+                    return False
+                GLib.idle_add(finish)
+            threading.Thread(target=work, daemon=True).start()
+
         def do_delete(self, names):
-            snap = remove_units(names); self.fill()
+            self.bg(lambda: remove_units(names), self.deleted)
+
+        def deleted(self, snap):
+            self.fill()
+            if isinstance(snap, Exception): return self.toast(f"Could not delete: {snap}"[:120])
             if snap["failed"]:
                 return self.toast("Could not delete " + ", ".join(snap["failed"]))
-            self.toast("Deleted", "Undo", lambda: (restore_units(snap), self.fill()))
+            self.toast("Deleted", "Undo", lambda: self.bg(lambda: restore_units(snap), lambda _r: self.fill()))
+
+        def run_now(self, service, live=True):
+            self.bg(lambda: start_service(service), lambda err: self.started(err, service, live))
+
+        def started(self, err, service, live):
+            if isinstance(err, Exception): err = str(err)
+            if err: return self.toast(f"Could not start: {err[:100]}")
+            if live: LogView(service, follow=True).present(self)      # watch it run
+            else: self.toast("Started")                               # an app has no output to follow
+            GLib.timeout_add(1500, lambda: (self.fill(), False)[1])    # so "Running now" shows up
 
         def task_row(self, m):
             t = m["timer"]
@@ -1057,7 +1314,7 @@ def gui():
             row.add_suffix(icon_btn("text-x-generic-symbolic", "View log",
                                     lambda: LogView(self.cur[t]["service"]).present(self)))
             row.add_suffix(icon_btn("media-playback-start-symbolic", "Run now",
-                                    lambda: (start_now(self.cur[t]), self.toast("Started"))))
+                                    lambda: self.run_now(self.cur[t]["service"], self.cur[t]["kind"] != "app")))
             sw = Gtk.Switch(valign=Gtk.Align.CENTER)
             sw.connect("state-set", lambda _s, on: self.on_switch(t, on))
             row.add_suffix(sw)
@@ -1095,7 +1352,7 @@ def gui():
             row.add_prefix(Gtk.Image(icon_name="emblem-system-symbolic"))
             row.add_suffix(icon_btn("text-x-generic-symbolic", "View log", lambda: LogView(svc).present(self)))
             row.add_suffix(icon_btn("media-playback-start-symbolic", "Run now",
-                                    lambda: (ctl("start", "--no-block", svc), self.toast("Started"))))
+                                    lambda: self.run_now(svc)))
             row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))     # the whole row opens its editor
             return row
 
@@ -1113,7 +1370,7 @@ def gui():
         def render(self, data):
             self.busy = False
             if data is not None:
-                self.services, self.has_tasks = data["services"], bool(data["tasks"])
+                self.services, self.has_tasks, self.sdver = data["services"], bool(data["tasks"]), data["systemd"]
                 if data["linger"] != self.linger: self.linger = data["linger"]; self.update_menu()
                 tasks, free = data["tasks"], data["free"]
                 self.cur = {m["timer"]: m for m in tasks}
@@ -1143,16 +1400,77 @@ def gui():
     return App().run([])
 
 
+def cmd_services():
+    """Diagnostics: what the service picker sees."""
+    print(f"running: {SELF}\ninstalled copy: {INSTALLED} ({'exists' if os.path.isfile(INSTALLED) else 'none'})")
+    for d in (UNITS, f"{APPS}/systemd/user"):
+        try: print(f"{d}: {sorted(os.listdir(d))}")
+        except OSError as e: print(f"{d}: {e.strerror}")
+    r = list_services(); print(f"\n{len(r)} services found:"); print("\n".join(r))
+    return 0
+
+def cmd_list():
+    """Print every task with its schedule, next run and last result."""
+    tasks = gather()["tasks"]
+    if not tasks: print("No tasks"); return 0
+    for m in tasks:
+        sub, _ = task_texts(m)
+        print(f"{m['unit']}: {m['name']}"); print("  " + sub.replace("\n", "\n  "))
+    return 0
+
+def find_runnable(name, data):
+    """The service a name refers to: a task's unit name, timer, or display name, or a service without a timer.
+    Returns (service, None) or (None, error text)."""
+    key = name.lower()
+    for m in data["tasks"]:
+        if key in (m["unit"].lower(), m["timer"].lower(), m["name"].lower(), m["service"].lower()):
+            return m["service"], None
+    for sv in data["free"]:
+        if key in (sv.lower(), sv[:-8].lower()): return sv, None
+    return None, f"No task or service named {name!r}. Try: reveille list"
+
+def cmd_run(name):
+    service, err = find_runnable(name, gather())
+    if err: print(err, file=sys.stderr); return 1
+    err = start_service(service)
+    print(f"Could not start {service}: {err}" if err else f"Started {service}", file=sys.stderr if err else sys.stdout)
+    return 1 if err else 0
+
+def cmd_menu(install):
+    err = install_menu() if install else uninstall_menu()
+    print(err or ("Added to the app menu" if install else "Removed from the app menu"))
+    return 1 if err else 0
+
+def cmd_gui():
+    try:
+        import gi
+        gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1")
+    except (ImportError, ValueError) as e:
+        print(f"reveille needs PyGObject, GTK 4 and libadwaita 1.5 or newer ({e}).\n"
+              "The command-line options still work: see reveille --help.", file=sys.stderr)
+        return 1
+    return gui()
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="reveille", description="GTK4/libadwaita front end for systemd user timers.")
+    ap.add_argument("--version", action="version", version=f"reveille {VERSION}")
+    sub = ap.add_subparsers(dest="cmd", metavar="COMMAND", title="commands (none opens the window)")
+    sub.add_parser("install", help="add reveille to the app menu")
+    sub.add_parser("uninstall", help="remove reveille from the app menu")
+    sub.add_parser("services", help="list the services the picker finds (troubleshooting)")
+    sub.add_parser("list", help="print every task with its schedule, next run and last result")
+    r = sub.add_parser("run", help="run a task or service now")
+    r.add_argument("name", help="task name or unit name, as shown by 'list'")
+    return ap
+
+def main(argv=None):
+    args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    if args.cmd == "services": return cmd_services()
+    if args.cmd == "list": return cmd_list()
+    if args.cmd == "run": return cmd_run(args.name)
+    if args.cmd in ("install", "uninstall"): return cmd_menu(args.cmd == "install")
+    return cmd_gui()
+
+
 if __name__ == "__main__":
-    if len(sys.argv) == 2 and sys.argv[1] == "services":        # diagnostics: what the service picker sees
-        print(f"running: {SELF}\ninstalled copy: {INSTALLED} ({'exists' if os.path.isfile(INSTALLED) else 'none'})")
-        for d in (UNITS, f"{APPS}/systemd/user"):
-            try: print(f"{d}: {sorted(os.listdir(d))}")
-            except OSError as e: print(f"{d}: {e.strerror}")
-        r = list_services(); print(f"\n{len(r)} services found:"); print("\n".join(r))
-        sys.exit(0)
-    if len(sys.argv) == 2 and sys.argv[1] in ("install", "uninstall"):
-        err = install_menu() if sys.argv[1] == "install" else uninstall_menu()
-        print(err or ("Added to the app menu" if sys.argv[1] == "install" else "Removed from the app menu"))
-        sys.exit(1 if err else 0)
-    sys.exit(gui())
+    sys.exit(main())
