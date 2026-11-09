@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for reveille's unit-file logic. No systemd, GTK or network needed: systemctl calls are stubbed
 and everything is written to a temporary XDG_CONFIG_HOME.   Run: python3 test_reveille.py"""
-import importlib.machinery, importlib.util, os, shutil, tempfile, unittest
+import importlib.machinery, importlib.util, os, shutil, tempfile, time, unittest
 
 TMP = tempfile.mkdtemp()
 os.environ["XDG_CONFIG_HOME"] = TMP
@@ -498,18 +498,18 @@ class Helpers(unittest.TestCase):
 
 class Gather(Base):
     """The window's data comes from one batched systemctl call per kind of unit."""
-    SHOW_TIMERS = ("Id=a.timer\nActiveState=active\nNextElapseUSecRealtime=Tue 2026-11-10 03:00:00 -03\n\n"
-                   "Id=b.timer\nActiveState=inactive\nNextElapseUSecRealtime=\n")
-    SHOW_SERVICES = ("Id=a.service\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=Mon 2026-11-09 03:00:01 -03\n\n"
-                     "Id=b.service\nResult=exit-code\nExecMainStatus=3\nExecMainExitTimestamp=Mon 2026-11-09 04:00:00 -03\n")
+    SHOW_TIMERS = ("Id=a.timer\nActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=Tue 2026-11-10 03:00:00 -03\n\n"
+                   "Id=b.timer\nActiveState=inactive\nUnitFileState=disabled\nNextElapseUSecRealtime=\n")
+    SHOW_SERVICES = ("Id=a.service\nActiveState=inactive\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=Mon 2026-11-09 03:00:01 -03\n\n"
+                     "Id=b.service\nActiveState=activating\nResult=exit-code\nExecMainStatus=3\nExecMainExitTimestamp=Mon 2026-11-09 04:00:00 -03\n")
 
     def setUp(self):
         super().setUp()
-        self.shows = []
+        self.shows, self.timer_out = [], self.SHOW_TIMERS
         def ctl(*a):
             if a[0] == "show":
                 self.shows.append(a)
-                out = self.SHOW_TIMERS if a[1].endswith(".timer") else self.SHOW_SERVICES
+                out = self.timer_out if a[1].endswith(".timer") else self.SHOW_SERVICES
                 return type("R", (), {"returncode": 0, "stderr": "", "stdout": out})()
             return fake_ctl(*a)
         self._old, rv.ctl = rv.ctl, ctl
@@ -529,10 +529,125 @@ class Gather(Base):
         self.assertEqual(len(self.shows), 2)
         a, b = d["tasks"]
         self.assertEqual((a["timer"], a["enabled"], a["next"]), ("a.timer", True, "Tue 2026-11-10 03:00:00 -03"))
+        self.assertEqual((a["fstate"], a["running"], b["fstate"], b["running"]), ("enabled", False, "disabled", True))
+        self.assertTrue(a["next_text"]); self.assertTrue(a["last_text"])
         self.assertEqual(a["last"], {"time": "Mon 2026-11-09 03:00:01 -03", "rc": 0})
         self.assertEqual((b["enabled"], b["next"], b["last"]["rc"]), (False, "", 3))
         self.assertEqual(d["free"], ["c.service"])
         self.assertIs(d["linger"], False)
+
+    def test_interval_timer_gets_a_next_time_from_its_monotonic_clock(self):
+        write("c.service", SIMPLE_SERVICE); write("c.timer", SIMPLE_TIMER)
+        self.timer_out = ("Id=c.timer\nActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=\n"
+                          f"NextElapseUSecMonotonic={time.monotonic() + 300:.3f}s\n")
+        (c,) = rv.gather()["tasks"]
+        self.assertEqual(c["next_text"], "in 5 min")
+
+
+class Times(unittest.TestCase):
+    NOW = time.mktime((2026, 11, 9, 12, 0, 0, 0, 0, -1))
+
+    def at(self, d, h, m=0): return time.mktime((2026, 11, d, h, m, 0, 0, 0, -1))
+
+    def test_relative_near(self):
+        n = self.NOW
+        for delta, want in ((30, "in less than a minute"), (-30, "just now"), (720, "in 12 min"), (-300, "5 min ago"),
+                            (2 * 3600 + 300, "in 2 h 5 min"), (3 * 3600, "in 3 h"), (-3 * 3600, "3 h ago")):
+            self.assertEqual(rv.relative(n + delta, n), want, delta)
+
+    def test_relative_days(self):
+        n = self.NOW
+        self.assertEqual(rv.relative(self.at(9, 19), n), "today 19:00")
+        self.assertEqual(rv.relative(self.at(10, 3), n), "tomorrow 03:00")
+        self.assertEqual(rv.relative(self.at(8, 3), n), "yesterday 03:00")
+        self.assertEqual(rv.relative(self.at(6, 3), n), "3 days ago")
+        far = self.at(20, 3)
+        self.assertEqual(rv.relative(far, n), time.strftime("%a %d %b %H:%M", time.localtime(far)))
+
+    def test_parse_ts(self):
+        self.assertEqual(rv.parse_ts("Tue 2026-11-10 03:00:00 -03"), self.at(10, 3))
+        self.assertEqual(rv.parse_ts("Tue 2026-11-10 03:00:00.123456 UTC"), self.at(10, 3))
+        for bad in ("", "n/a", None): self.assertIsNone(rv.parse_ts(bad))
+
+    def test_fractional_spans(self):
+        self.assertEqual(rv.parse_span_f("1h 2min 3.5s"), 3723.5); self.assertEqual(rv.parse_span_f("250ms"), 0.25)
+        self.assertEqual(rv.parse_span_f("0"), 0.0)
+        for bad in ("", "infinity", "soon"): self.assertIsNone(rv.parse_span_f(bad), bad)
+
+    def test_next_run_epoch(self):
+        cal = {"NextElapseUSecRealtime": "Tue 2026-11-10 03:00:00 -03", "NextElapseUSecMonotonic": "1h"}
+        self.assertEqual(rv.next_run_epoch(cal, 1000, 500), self.at(10, 3))               # wall-clock time wins
+        self.assertEqual(rv.next_run_epoch({"NextElapseUSecMonotonic": "1h"}, 1000, 500), 1000 + 3600 - 500)
+        for kv in ({}, {"NextElapseUSecMonotonic": "0"}, {"NextElapseUSecMonotonic": "infinity"}):
+            self.assertIsNone(rv.next_run_epoch(kv, 1000, 500), kv)
+
+
+class RowText(unittest.TestCase):
+    def m(self, **kw):
+        m = {"trigger": {**rv.DEFAULT_TR}, "enabled": True, "fstate": "enabled", "next": "Tue 2026-11-10 03:00:00 -03",
+             "next_text": "in 5 min", "last": None, "last_text": "", "running": False}
+        m.update(kw); return m
+
+    def test_active_and_enabled(self):
+        sub, tip = rv.task_texts(self.m())
+        self.assertEqual(sub, "Every day at 03:00\nNext: in 5 min"); self.assertEqual(tip, "Next: Tue 2026-11-10 03:00:00 -03")
+
+    def test_active_but_not_enabled_says_so(self):
+        for st in ("disabled", "static", "transient"):
+            self.assertIn("Not enabled", rv.task_texts(self.m(fstate=st))[0], st)
+        self.assertNotIn("Not enabled", rv.task_texts(self.m(fstate=""))[0])             # unknown: don't guess
+
+    def test_inactive_is_stopped_or_disabled(self):
+        self.assertIn("Stopped, starts again at next login", rv.task_texts(self.m(enabled=False))[0])
+        self.assertIn("Disabled", rv.task_texts(self.m(enabled=False, fstate="disabled"))[0])
+
+    def test_running_and_failed(self):
+        last = {"time": "Mon 2026-11-09 04:00:00 -03", "rc": 3}
+        sub, tip = rv.task_texts(self.m(running=True, last=last, last_text="5 min ago"))
+        self.assertTrue(sub.endswith("Running now · Last: 5 min ago failed (3)"))
+        self.assertIn("Last: Mon 2026-11-09 04:00:00 -03", tip)
+
+    def test_unknown_next(self):
+        self.assertIn("Next: when triggered", rv.task_texts(self.m(next_text="", next=""))[0])
+
+
+class SetTimer(unittest.TestCase):
+    def setUp(self):
+        self._ctl, self.calls = rv.ctl, []
+
+    def tearDown(self): rv.ctl = self._ctl
+
+    def machine(self, enable_ok=True, enable_activates=True, start_ok=True):
+        state = {"active": False}
+        def ctl(*a):
+            self.calls.append(a[0])
+            if a[0] == "show": return Proc(stdout=f"ActiveState={'active' if state['active'] else 'inactive'}\n")
+            if a[0] in ("enable", "disable"):
+                if not enable_ok: return Proc(stderr="no installation config", returncode=1)
+                if enable_activates: state["active"] = a[0] == "enable"
+                return Proc()
+            if not start_ok: return Proc(stderr="boom", returncode=1)
+            state["active"] = a[0] == "start"; return Proc()
+        rv.ctl = ctl; return state
+
+    def test_normal_on_and_off(self):
+        st = self.machine()
+        self.assertIsNone(rv.set_timer("x.timer", True)); self.assertTrue(st["active"])
+        self.assertIsNone(rv.set_timer("x.timer", False)); self.assertFalse(st["active"])
+        self.assertNotIn("start", self.calls); self.assertNotIn("stop", self.calls)
+
+    def test_timer_without_install_section_falls_back_to_start_and_stop(self):
+        st = self.machine(enable_ok=False)
+        self.assertIsNone(rv.set_timer("x.timer", True)); self.assertTrue(st["active"])
+        self.assertIsNone(rv.set_timer("x.timer", False)); self.assertFalse(st["active"])
+
+    def test_enable_that_does_not_start_is_noticed(self):
+        st = self.machine(enable_activates=False)
+        self.assertIsNone(rv.set_timer("x.timer", True)); self.assertTrue(st["active"])
+
+    def test_failure_is_reported(self):
+        self.machine(enable_ok=False, start_ok=False)
+        self.assertEqual(rv.set_timer("x.timer", True), "boom")
 
 
 if __name__ == "__main__":

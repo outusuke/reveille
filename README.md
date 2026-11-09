@@ -21,6 +21,10 @@ The window lists every timer in `~/.config/systemd/user/`, whether reveille wrot
 
 `install` only adds the app-menu entry (it copies the script to `~/.local/share/reveille/` so moving the download doesn't break the entry).
 
+## What a row tells you
+
+Each row shows the schedule, when it runs next and when it last ran, in plain terms ("in 12 min", "tomorrow 03:00", "yesterday 03:00"); hover for the exact times. A task that is running right now says so. The switch shows whether the timer is active, and the row says when that differs from what a restart will do: "Not enabled: won't start again after a restart" for a timer that is running but not enabled, "Stopped, starts again at next login" for one that is enabled but stopped. Timers written without an `[Install]` section can't be enabled, so the switch falls back to plain start and stop for them, and if systemd refuses, the reason is shown.
+
 ## Logs and running while logged out
 
 Every task row has a log button that shows the last 200 lines of the service's journal (the same as `journalctl --user -u NAME.service`), with Reload and Copy. Services without a timer have it too.

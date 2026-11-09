@@ -9,7 +9,7 @@ in ~/.config/systemd/user. Nothing else is kept on disk, and the timers never ca
   reveille uninstall    remove it from the app menu
   reveille services     list what the service picker finds (for troubleshooting)
 """
-import os, re, shlex, shutil, subprocess, sys, tempfile, threading
+import datetime, os, re, shlex, shutil, subprocess, sys, tempfile, threading, time
 
 HOME = os.path.expanduser("~")
 CONF = os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config")
@@ -26,6 +26,7 @@ DEFAULT_TR = {"type": "daily", "hour": 3, "minute": 0, "days": ["Mon"], "dom": 1
 SCHEDULE_KEYS = ("OnCalendar", "OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnActiveSec", "OnUnitInactiveSec",
                  "Persistent", "RandomizedDelaySec")
 ONLINE = "network-online.target"
+BOOT_OK = {"enabled", "enabled-runtime", "indirect", "alias"}     # UnitFileState values that survive a restart
 
 
 # ---------------------------------------------------------------- unit files
@@ -133,6 +134,49 @@ def parse_span(text):
         if u not in SPAN_UNITS: return None
         total += int(n) * SPAN_UNITS[u]
     return int(total)
+
+def parse_span_f(text):
+    """Like parse_span, for the fractional spans systemctl prints ("1h 2min 3.5s"): seconds as a float, or None."""
+    text = text.strip()
+    if not re.fullmatch(r"(?:\d+(?:\.\d+)?\s*[a-z]*\s*)+", text): return None
+    total = 0.0
+    for n, u in re.findall(r"(\d+(?:\.\d+)?)\s*([a-z]*)", text):
+        if u not in SPAN_UNITS: return None
+        total += float(n) * SPAN_UNITS[u]
+    return total
+
+def parse_ts(text):
+    """A timestamp as systemctl prints it ("Tue 2026-11-10 03:00:00 -03", local time) as epoch seconds, or None."""
+    m = re.search(r"(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)", text or "")
+    return time.mktime((*map(int, m.groups()), 0, 0, -1)) if m else None
+
+def next_run_epoch(kv, now=None, mono=None):
+    """When a timer fires next, from its properties. Calendar timers carry a wall-clock time; interval and login
+    timers only a monotonic one, which is turned into wall-clock time with the same clock Python uses."""
+    t = parse_ts(kv.get("NextElapseUSecRealtime", ""))
+    if t: return t
+    span = parse_span_f(kv.get("NextElapseUSecMonotonic", ""))
+    if not span: return None                    # 0, "infinity" or unreadable: nothing is scheduled
+    now = time.time() if now is None else now
+    mono = time.monotonic() if mono is None else mono
+    return now + (span - mono)
+
+def relative(epoch, now=None):
+    """A moment as people say it: "in 12 min", "tomorrow 03:00", "yesterday 03:00", "3 days ago"."""
+    now = time.time() if now is None else now
+    d = epoch - now; a = abs(d); fut = d > 0
+    if a < 60: return "in less than a minute" if fut else "just now"
+    if a < 3600: n = round(a / 60); return f"in {n} min" if fut else f"{n} min ago"
+    days = (datetime.date.fromtimestamp(epoch) - datetime.date.fromtimestamp(now)).days
+    clock = time.strftime("%H:%M", time.localtime(epoch))
+    if days == 0 and a < 6 * 3600:
+        h, m = divmod(round(a / 60), 60); span = f"{h} h" + (f" {m} min" if m else "")
+        return f"in {span}" if fut else f"{span} ago"
+    if days == 0: return f"today {clock}"
+    if days == 1: return f"tomorrow {clock}"
+    if days == -1: return f"yesterday {clock}"
+    if -7 < days < 0: return f"{-days} days ago"
+    return time.strftime("%a %d %b %H:%M", time.localtime(epoch))
 
 def ctl(*a):
     return subprocess.run(["systemctl", "--user", *a], capture_output=True, text=True)
@@ -339,8 +383,10 @@ def load_task(timer, status=None):
     m = {"timer": timer, "unit": base, "service": target, "name": desc or base, "kind": "service", "full": False,
          "trigger": sched[0] if sched else None, "catchup": sched[1] if sched else True,
          "adv": {"delay": sched[2] if sched else 0},
+         # "enabled" means the timer is active (will fire); "fstate" says whether it also survives a restart
          "enabled": (status[timer].get("ActiveState") == "active" if status is not None and timer in status
-                     else unit_status(timer)[1])}
+                     else unit_status(timer)[1]),
+         "fstate": status[timer].get("UnitFileState", "") if status is not None and timer in status else ""}
     if not sched: return m
     if target == base + ".service" and os.path.isfile(f"{UNITS}/{target}"):
         s = parse_service(target)
@@ -501,8 +547,16 @@ def restore_units(snap):
     ctl("daemon-reload")
     for n in snap["enable"]: ctl("enable", "--now", n)
 
-def set_timers(names, on):
-    for n in names: ctl("enable" if on else "disable", "--now", n)
+def set_timer(name, on):
+    """Turn a timer on (enable and start) or off (disable and stop). A hand-written timer without an [Install]
+    section can't be enabled, so plain start/stop is the fallback. Returns an error text or None."""
+    r = ctl("enable" if on else "disable", "--now", name)
+    err = r.stderr.strip() if r.returncode else ""
+    if r.returncode or unit_status(name)[1] != on:
+        r2 = ctl("start" if on else "stop", name)
+        if r2.returncode: return r2.stderr.strip() or err or "systemctl failed"
+        if unit_status(name)[1] != on: return err or "The timer did not change state"
+    return None
 
 def start_now(m):
     ctl("start", "--no-block", m["service"])
@@ -538,16 +592,39 @@ def read_log(service, lines=200):
     text = r.stdout.strip()
     return (text, None) if text and not text.startswith("-- No entries") else (LOG_HINT.format(unit=service), None)
 
+def task_texts(m):
+    """(subtitle, tooltip) of a task row, from what gather() collected."""
+    lines = [describe(m["trigger"]) if m["trigger"] else "Custom schedule"]
+    if m["enabled"]:
+        lines.append("Next: " + (m["next_text"] or "when triggered"))
+        if m["fstate"] and m["fstate"] not in BOOT_OK: lines.append("Not enabled: won't start again after a restart")
+    else:
+        lines.append("Stopped, starts again at next login" if m["fstate"] in BOOT_OK else "Disabled")
+    last, status = m["last"], []
+    if m["running"]: status.append("Running now")
+    if last: status.append(f"Last: {m['last_text']} " + ("OK" if last["rc"] == 0 else f"failed ({last['rc']})"))
+    if status: lines.append(" · ".join(status))
+    tip = [f"Next: {m['next']}" if m["enabled"] and m["next"] else "", f"Last: {last['time']}" if last else ""]
+    return "\n".join(lines), "\n".join(x for x in tip if x)
+
 def gather():
     """Everything the window lists, fetched with two systemctl calls however many tasks there are.
     No GTK in here, so it can run off the main thread."""
     timers = user_timers()
-    st = show_many(timers, "ActiveState", "NextElapseUSecRealtime")
+    st = show_many(timers, "ActiveState", "UnitFileState", "NextElapseUSecRealtime", "NextElapseUSecMonotonic")
     tasks = [m for m in (load_task(t, st) for t in timers) if m]
-    sv = show_many(sorted({m["service"] for m in tasks}), "Result", "ExecMainStatus", "ExecMainExitTimestamp")
+    sv = show_many(sorted({m["service"] for m in tasks}), "ActiveState", "Result", "ExecMainStatus",
+                   "ExecMainExitTimestamp")
+    now, mono = time.time(), time.monotonic()
     for m in tasks:
-        m["next"] = st.get(m["timer"], {}).get("NextElapseUSecRealtime", "").strip()
-        m["last"] = last_run_from(sv.get(m["service"], {}))
+        kv, svc = st.get(m["timer"], {}), sv.get(m["service"], {})
+        m["next"] = kv.get("NextElapseUSecRealtime", "").strip()
+        ep = next_run_epoch(kv, now, mono)
+        m["next_text"] = ("any moment" if ep <= now else relative(ep, now)) if ep else ""
+        m["last"] = last_run_from(svc)
+        lt = parse_ts(m["last"]["time"]) if m["last"] else None
+        m["last_text"] = relative(lt, now) if lt else (m["last"] or {}).get("time", "")
+        m["running"] = svc.get("ActiveState") in ("activating", "active")
     tasks.sort(key=lambda m: m["name"].lower())
     return {"tasks": tasks, "free": unscheduled_services(timers), "services": list_services(),
             "linger": linger_state()}
@@ -889,7 +966,8 @@ def gui():
                                              halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER), "loading")
             self.stack.add_named(empty, "empty"); self.stack.add_named(Gtk.ScrolledWindow(child=clamp), "list")
             tv.set_content(self.stack); self.overlay.set_child(tv); self.set_content(self.overlay)
-            self.services, self.busy, self.again, self.sig, self.has_tasks = [], False, False, None, False
+            self.services, self.busy, self.again, self.shape, self.has_tasks = [], False, False, None, False
+            self.cur, self.rows, self.syncing = {}, {}, False
             self.stack.set_visible_child_name("loading")
             self.fill()
             GLib.timeout_add_seconds(30, lambda: (self.fill(), True)[1])
@@ -973,26 +1051,43 @@ def gui():
             self.toast("Deleted", "Undo", lambda: (restore_units(snap), self.fill()))
 
         def task_row(self, m):
-            last, nxt, active = m["last"], m["next"], m["enabled"]
-            parts = [describe(m["trigger"]) if m["trigger"] else "Custom schedule"]
-            if active: parts.append(f"Next: {nxt}" if nxt else "Next: when triggered")
-            else: parts.append("Disabled")
-            if last: parts.append(f"Last: {last['time']} " + ("OK" if last["rc"] == 0 else f"failed ({last['rc']})"))
-            row = Adw.ActionRow(title=GLib.markup_escape_text(m["name"]),
-                                subtitle=GLib.markup_escape_text("\n".join(parts)), activatable=True)
-            bad = last and last["rc"] != 0
-            img = Gtk.Image(icon_name="dialog-warning-symbolic" if bad else "alarm-symbolic")
-            if bad: img.add_css_class("error")
-            row.add_prefix(img)
+            t = m["timer"]
+            row = Adw.ActionRow(activatable=True)
+            img = Gtk.Image(); row.add_prefix(img)
             row.add_suffix(icon_btn("text-x-generic-symbolic", "View log",
-                                    lambda: LogView(m["service"]).present(self)))
+                                    lambda: LogView(self.cur[t]["service"]).present(self)))
             row.add_suffix(icon_btn("media-playback-start-symbolic", "Run now",
-                                    lambda: (start_now(m), self.toast("Started"))))
-            sw = Gtk.Switch(active=active, valign=Gtk.Align.CENTER)
-            sw.connect("state-set", lambda _s, on: (set_timers([m["timer"]], on), GLib.idle_add(self.fill), False)[2])
+                                    lambda: (start_now(self.cur[t]), self.toast("Started"))))
+            sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+            sw.connect("state-set", lambda _s, on: self.on_switch(t, on))
             row.add_suffix(sw)
-            row.connect("activated", lambda _r: self.edit(m))
+            row.connect("activated", lambda _r: self.edit(self.cur[t]))   # always the latest data, rows live on
+            self.rows[t] = (row, img, sw)
             return row
+
+        def paint(self, m):
+            """Bring a row up to date without rebuilding it, so the list keeps its scroll position."""
+            row, img, sw = self.rows[m["timer"]]
+            sub, tip = task_texts(m)
+            row.set_title(GLib.markup_escape_text(m["name"])); row.set_subtitle(GLib.markup_escape_text(sub))
+            row.set_tooltip_text(tip or None)
+            bad = bool(m["last"] and m["last"]["rc"] != 0)
+            img.set_from_icon_name("dialog-warning-symbolic" if bad else "alarm-symbolic")
+            (img.add_css_class if bad else img.remove_css_class)("error")
+            self.syncing = True; sw.set_active(m["enabled"]); self.syncing = False
+
+        def on_switch(self, timer, on):
+            if self.syncing: return False                     # we are only showing the real state
+            def work():
+                err = set_timer(timer, on)
+                GLib.idle_add(self.switched, on, err)
+            threading.Thread(target=work, daemon=True).start()
+            return False
+
+        def switched(self, on, err):
+            if err: self.toast(f"Could not {'turn on' if on else 'turn off'} the timer: {err[:100]}")
+            self.fill()                                       # on failure this snaps the switch back to the truth
+            return False
 
         def free_row(self, svc):
             row = Adw.ActionRow(title=GLib.markup_escape_text(svc), subtitle="No schedule · click to schedule or delete", activatable=True)
@@ -1020,10 +1115,11 @@ def gui():
             if data is not None:
                 self.services, self.has_tasks = data["services"], bool(data["tasks"])
                 if data["linger"] != self.linger: self.linger = data["linger"]; self.update_menu()
-                sig = repr((data["tasks"], data["free"]))
-                if sig != self.sig:                       # unchanged: leave the list (and its scroll position) alone
-                    self.sig = sig
-                    tasks, free = data["tasks"], data["free"]
+                tasks, free = data["tasks"], data["free"]
+                self.cur = {m["timer"]: m for m in tasks}
+                shape = (tuple(m["timer"] for m in tasks), tuple(free))
+                if shape != self.shape:                       # rows added or removed: rebuild the lists
+                    self.shape, self.rows = shape, {}
                     for lst in (self.list, self.free_list):
                         while (r := lst.get_first_child()) is not None: lst.remove(r)
                     self.stack.set_visible_child_name("list" if tasks or free else "empty")
@@ -1031,7 +1127,8 @@ def gui():
                     self.h2.set_visible(bool(free)); self.free_list.set_visible(bool(free))
                     for m in tasks: self.list.append(self.task_row(m))
                     for sv in free: self.free_list.append(self.free_row(sv))
-            elif self.sig is None:                        # first load failed: don't spin forever
+                for m in tasks: self.paint(m)
+            elif self.shape is None:                          # first load failed: don't spin forever
                 self.stack.set_visible_child_name("empty")
             self.show_banner()
             if self.again: self.again = False; self.fill()
