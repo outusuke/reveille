@@ -57,7 +57,7 @@ class RoundTrip(Base):
         self.assertEqual(m["trigger"]["days"], ["Mon", "Fri"])
         self.assertEqual((m["trigger"]["hour"], m["trigger"]["minute"]), (7, 30))
         self.assertEqual(m["adv"], {"cwd": "/tmp", "env": "A=1 'B=x y'", "timeout": 5, "ac": True,
-                                    "online": True, "delay": 60, "retries": 0, "retry_wait": 5, "low": False, "path": "", "then": ""})
+                                    "online": True, "delay": 60, "retries": 0, "retry_wait": 5, "low": False, "path": "", "then": "", "fail": ""})
         self.assertIn("echo $HOME | cat", m["command"])
 
     def test_percent_and_dollar_are_escaped_in_the_files(self):
@@ -188,7 +188,7 @@ class Editable(Base):
             self.assertIn(line, svc)
         write("x.service", svc)
         s2 = rv.parse_service("x.service")
-        self.assertEqual(s2["adv"], {"cwd": "/tmp", "env": "A=1", "timeout": 5, "ac": True, "online": True, "retries": 0, "retry_wait": 5, "low": False, "path": "", "then": ""})
+        self.assertEqual(s2["adv"], {"cwd": "/tmp", "env": "A=1", "timeout": 5, "ac": True, "online": True, "retries": 0, "retry_wait": 5, "low": False, "path": "", "then": "", "fail": ""})
         svc3, _ = self.save(m, adv={"cwd": "", "env": "", "timeout": 0, "ac": False, "online": False, "delay": 0})
         self.assertEqual(svc3, GPODDER_SERVICE)
 
@@ -271,8 +271,8 @@ class Schedules(unittest.TestCase):
         self.assertEqual(self.parse(OnCalendar="*-*-29 09:00:00")[0]["type"], "custom")
 
     def test_two_calendar_lines_become_one_custom_expression(self):
-        tr = self.parse(OnCalendar=["*-*-* 07:10:00", "*-*-* 18:00:00"])[0]
-        self.assertEqual((tr["type"], tr["expr"]), ("custom", "*-*-* 07:10:00 | *-*-* 18:00:00"))
+        tr = self.parse(OnCalendar=["*-*-* 07:10:00", "Mon *-*-* 18:00:00"])[0]
+        self.assertEqual((tr["type"], tr["expr"]), ("custom", "*-*-* 07:10:00 | Mon *-*-* 18:00:00"))
 
     def test_interval_and_login(self):
         tr = self.parse(OnStartupSec="30min", OnUnitActiveSec="30min")[0]
@@ -968,6 +968,340 @@ class FollowLogTests(unittest.TestCase):
     def test_missing_journalctl_is_an_error_text_not_a_crash(self):
         os.environ["PATH"] = self.dir                                    # an empty folder: no journalctl anywhere
         self.assertEqual(rv.FollowLog("x.service", lambda l: None).start(), "journalctl is not available")
+
+
+class LoginDelay(Editable):
+    """"At login" keeps the delay it was written with."""
+    def tim(self, line): return "[Timer]\n" + line + "\n[Install]\nWantedBy=timers.target\n"
+
+    def test_the_delay_is_read(self):
+        for text, secs in (("45s", 45), ("10s", 10), ("2min", 120), ("0", 0), ("1h 30min", 5400)):
+            tr = rv.parse_schedule({"OnStartupSec": [text]})[0]
+            self.assertEqual((tr["type"], tr["login_sec"]), ("login", secs), text)
+        self.assertIsNone(rv.parse_schedule({"OnStartupSec": ["soon"]}))
+        self.assertIsNone(rv.parse_schedule({"OnStartupSec": ["1500ms"]}))          # not whole seconds: don't round it
+
+    def test_saving_keeps_the_original_value(self):
+        m = self.load(SIMPLE_SERVICE, self.tim("OnStartupSec=45s"))
+        self.assertEqual(m["trigger"]["login_sec"], 45)
+        _, tim = self.save(m)
+        self.assertIn("OnStartupSec=45s", tim); self.assertNotIn("10s", tim)
+
+    def test_a_longer_delay_keeps_its_meaning(self):
+        m = self.load(SIMPLE_SERVICE, self.tim("OnStartupSec=5min"))
+        _, tim = self.save(m)
+        self.assertIn("OnStartupSec=5min", tim)
+
+    def test_a_new_login_task_gets_ten_seconds(self):
+        rv.apply_task(task(trigger={**rv.DEFAULT_TR, "type": "login"}))
+        self.assertIn("OnStartupSec=10s", read(f"{rv.UNITS}/backup.timer"))
+
+    def test_describe_says_so_only_when_it_is_not_the_default(self):
+        self.assertEqual(rv.describe({**rv.DEFAULT_TR, "type": "login"}), "At login")
+        self.assertEqual(rv.describe({**rv.DEFAULT_TR, "type": "login", "login_sec": 300}), "At login, after 5 min")
+
+
+class CatchUp(Base):
+    def test_only_calendar_schedules_have_missed_runs(self):
+        for tp in ("interval", "login"):
+            self.assertNotIn(tp, rv.CALENDAR_TYPES)
+            self.assertNotIn("Persistent=true", rv.timer_lines({**rv.DEFAULT_TR, "type": tp}, True, 0))
+        for tp in ("daily", "weekdays", "weekly", "monthly", "lastday", "times", "custom"):
+            self.assertIn(tp, rv.CALENDAR_TYPES)
+            tr = {**rv.DEFAULT_TR, "type": tp, "expr": "Mon 09:00"}
+            self.assertIn("Persistent=true", rv.timer_lines(tr, True, 0), tp)
+            self.assertNotIn("Persistent=true", rv.timer_lines(tr, False, 0), tp)
+
+    def test_every_trigger_the_editor_offers_is_known(self):
+        self.assertEqual(len(rv.TRIGGERS), len(rv.TRIGGER_IDS))
+        self.assertEqual(set(rv.TRIGGER_IDS) - {"interval", "login"}, rv.CALENDAR_TYPES)
+
+
+class DropIns(Editable):
+    """NAME.service.d/*.conf can change what the editor shows; it must say so instead of showing a stale value."""
+    def dropin(self, unit, text, name="override.conf"):
+        os.makedirs(f"{rv.UNITS}/{unit}.d", exist_ok=True); write(f"{unit}.d/{name}", text)
+
+    def test_no_drop_ins_no_note(self):
+        m = self.load(SIMPLE_SERVICE); self.assertEqual(m["dropins"], []); self.assertTrue(m["full"])
+
+    def test_an_override_of_the_command_limits_the_task_and_names_the_file(self):
+        write("x.service", SIMPLE_SERVICE); write("x.timer", SIMPLE_TIMER)
+        self.dropin("x.service", "[Service]\nExecStart=\nExecStart=/usr/bin/false\n")
+        m = rv.load_task("x.timer")
+        self.assertFalse(m["full"]); self.assertIsNotNone(m["trigger"])             # the schedule is still editable
+        self.assertIn("x.service.d/override.conf", m["why"]); self.assertIn("ExecStart=", m["why"])
+        self.assertEqual(m["dropins"], ["x.service.d/override.conf"])
+
+    def test_every_managed_service_setting_counts(self):
+        for sect, key in (("Service", "Environment=A=1"), ("Service", "TimeoutStartSec=5min"), ("Service", "Nice=5"),
+                          ("Unit", "ConditionPathExists=/x"), ("Unit", "OnSuccess=a.service"),
+                          ("Unit", "OnFailure=a.service"), ("Unit", "Wants=network-online.target")):
+            shutil.rmtree(f"{rv.UNITS}/x.service.d", ignore_errors=True)
+            write("x.service", SIMPLE_SERVICE); write("x.timer", SIMPLE_TIMER)
+            self.dropin("x.service", f"[{sect}]\n{key}\n")
+            self.assertFalse(rv.load_task("x.timer")["full"], key)
+
+    def test_unrelated_overrides_only_get_a_note(self):
+        write("x.service", SIMPLE_SERVICE); write("x.timer", SIMPLE_TIMER)
+        self.dropin("x.service", "[Service]\nMemoryMax=1G\n[Unit]\nAfter=graphical-session.target\n")
+        m = rv.load_task("x.timer")
+        self.assertTrue(m["full"]); self.assertEqual(m["dropins"], ["x.service.d/override.conf"])
+
+    def test_a_timer_drop_in_that_changes_the_schedule_hides_it(self):
+        write("x.service", SIMPLE_SERVICE); write("x.timer", SIMPLE_TIMER)
+        self.dropin("x.timer", "[Timer]\nOnCalendar=\nOnCalendar=hourly\n")
+        m = rv.load_task("x.timer")
+        self.assertIsNone(m["trigger"]); self.assertFalse(m["full"]); self.assertIn("x.timer.d/override.conf", m["why"])
+
+    def test_a_timer_drop_in_about_something_else_is_fine(self):
+        write("x.service", SIMPLE_SERVICE); write("x.timer", SIMPLE_TIMER)
+        self.dropin("x.timer", "[Timer]\nAccuracySec=1h\n")
+        m = rv.load_task("x.timer"); self.assertTrue(m["full"]); self.assertEqual(m["dropins"], ["x.timer.d/override.conf"])
+
+    def test_only_conf_files_count_and_saving_leaves_them_alone(self):
+        write("x.service", SIMPLE_SERVICE); write("x.timer", SIMPLE_TIMER)
+        self.dropin("x.service", "[Service]\nMemoryMax=1G\n"); self.dropin("x.service", "ignored", "notes.txt")
+        m = rv.load_task("x.timer"); self.assertEqual(m["dropins"], ["x.service.d/override.conf"])
+        self.save(m, trigger={**WEEKLY})
+        self.assertEqual(read(f"{rv.UNITS}/x.service.d/override.conf"), "[Service]\nMemoryMax=1G\n")
+
+    def test_a_task_for_an_existing_service_ignores_that_services_drop_ins(self):
+        write("x.timer", SIMPLE_TIMER.replace("[Timer]\n", "[Timer]\nUnit=other.service\n"))
+        self.dropin("other.service", "[Service]\nExecStart=/bin/false\n")
+        self.assertTrue(rv.load_task("x.timer")["full"])
+
+
+class ServiceList(Base):
+    def test_the_refresh_does_not_list_services(self):
+        calls = []
+        old = rv.list_services; rv.list_services = lambda: calls.append(1) or []
+        old_sh = rv.sh; rv.sh = lambda *a, **k: Proc(stdout="Linger=no\n")
+        try:
+            write("a.service", SIMPLE_SERVICE); write("a.timer", SIMPLE_TIMER)
+            d = rv.gather()
+        finally: rv.list_services, rv.sh = old, old_sh
+        self.assertEqual(calls, []); self.assertNotIn("services", d); self.assertEqual(len(d["tasks"]), 1)
+
+
+class FailureHandler(Base):
+    """"If it fails, run": OnFailure=, with the same loop check as "Then run"."""
+    def roundtrip(self, **kw):
+        t = task(adv=adv(**kw)); self.assertIsNone(rv.apply_task(t))
+        return rv.load_task(f"{t['unit']}.timer"), read(f"{rv.UNITS}/{t['unit']}.service")
+
+    def test_round_trip_and_clearing(self):
+        m, svc = self.roundtrip(fail="notify.service")
+        self.assertIn("OnFailure=notify.service", svc); self.assertEqual(m["adv"]["fail"], "notify.service")
+        self.assertTrue(m["full"])
+        m2, svc2 = self.roundtrip(fail="")
+        self.assertNotIn("OnFailure", svc2); self.assertEqual(m2["adv"]["fail"], "")
+
+    def test_both_handlers_can_be_set(self):
+        m, svc = self.roundtrip(then="a.service", fail="b.service")
+        self.assertEqual((m["adv"]["then"], m["adv"]["fail"]), ("a.service", "b.service"))
+
+    def test_a_template_instance_is_kept_as_written(self):
+        m, svc = self.roundtrip(fail="notify@%n.service")        # %n is meant: it is not escaped like other text
+        self.assertIn("OnFailure=notify@%n.service", svc); self.assertEqual(m["adv"]["fail"], "notify@%n.service")
+
+    def test_several_handlers_cannot_be_shown(self):
+        write("x.service", SIMPLE_SERVICE.replace("[Service]", "OnFailure=a.service b.service\n[Service]"))
+        self.assertIn("OnFailure", rv.parse_service("x.service")["why"])
+
+    def test_the_loop_check_follows_failure_links_and_mixed_ones(self):
+        def link(name, key="", target=""):
+            write(name, "[Unit]\n" + (f"{key}={target}\n" if key else "") + "[Service]\nExecStart=/usr/bin/true\n")
+        link("b.service", "OnFailure", "a.service"); self.assertTrue(rv.then_cycle("a.service", "b.service"))
+        link("b.service", "OnSuccess", "c.service"); link("c.service", "OnFailure", "a.service")
+        self.assertTrue(rv.then_cycle("a.service", "b.service"))
+        link("c.service"); self.assertFalse(rv.then_cycle("a.service", "b.service"))
+
+    def test_drop_in_failure_handler_is_noticed(self):
+        write("x.service", SIMPLE_SERVICE); write("x.timer", SIMPLE_TIMER)
+        os.makedirs(f"{rv.UNITS}/x.service.d"); write("x.service.d/o.conf", "[Unit]\nOnFailure=n.service\n")
+        self.assertIn("OnFailure=", rv.load_task("x.timer")["why"])
+
+
+class Intervals(Base):
+    def parse(self, **kv):
+        return rv.parse_schedule({k: v if isinstance(v, list) else [v] for k, v in kv.items()})
+
+    def trig(self, **kv):
+        r = self.parse(**kv); return r and (r[0]["type"], r[0]["every"], r[0]["unit"])
+
+    def test_every_unit_is_read(self):
+        self.assertEqual(self.trig(OnUnitActiveSec="30s"), ("interval", 30, "s"))
+        self.assertEqual(self.trig(OnUnitActiveSec="15min"), ("interval", 15, "min"))
+        self.assertEqual(self.trig(OnUnitActiveSec="2h"), ("interval", 2, "h"))
+        self.assertEqual(self.trig(OnUnitActiveSec="3d"), ("interval", 3, "d"))
+
+    def test_compound_and_odd_spellings_are_read_not_locked(self):
+        self.assertEqual(self.trig(OnUnitActiveSec="1h 30min"), ("interval", 90, "min"))
+        self.assertEqual(self.trig(OnUnitActiveSec="1h30min"), ("interval", 90, "min"))
+        self.assertEqual(self.trig(OnUnitActiveSec="90"), ("interval", 90, "s"))
+        self.assertEqual(self.trig(OnUnitActiveSec="1.5h"), ("interval", 90, "min"))
+        self.assertEqual(self.trig(OnUnitActiveSec="24h"), ("interval", 1, "d"))
+        self.assertEqual(self.trig(OnStartupSec="1h 30min", OnUnitActiveSec="90min"), ("interval", 90, "min"))
+
+    def test_what_cannot_be_shown_stays_unedited(self):
+        self.assertIsNone(self.parse(OnUnitActiveSec="0"))
+        self.assertIsNone(self.parse(OnUnitActiveSec="500ms"))
+        self.assertIsNone(self.parse(OnUnitActiveSec="soon"))
+        self.assertIsNone(self.parse(OnUnitActiveSec="30min", OnStartupSec="5min"))       # a different first run
+        self.assertIsNone(self.parse(OnUnitActiveSec=f"{rv.MAX_EVERY + 1}s"))              # longer than the box holds
+        self.assertIsNone(self.parse(OnUnitActiveSec=["5min", "10min"]))
+
+    def test_written_in_the_shortest_exact_form(self):
+        for every, unit, text in ((30, "s", "30s"), (90, "s", "90s"), (120, "s", "2min"), (90, "min", "90min"),
+                                  (120, "min", "2h"), (36, "h", "36h"), (48, "h", "2d"), (1, "d", "1d")):
+            lines = rv.timer_lines({**rv.DEFAULT_TR, "type": "interval", "every": every, "unit": unit}, True, 0)
+            self.assertEqual(lines[:2], [f"OnStartupSec={text}", f"OnUnitActiveSec={text}"], (every, unit))
+
+    def test_every_value_survives_a_round_trip(self):
+        for every, unit in ((10, "s"), (45, "s"), (90, "s"), (5, "min"), (90, "min"), (6, "h"), (36, "h"), (2, "d")):
+            tr = {**rv.DEFAULT_TR, "type": "interval", "every": every, "unit": unit}
+            kv = {}
+            for l in rv.timer_lines(tr, True, 0): k, v = l.split("=", 1); kv.setdefault(k, []).append(v)
+            back = rv.parse_schedule(kv)[0]
+            self.assertEqual(rv.interval_seconds(back), rv.interval_seconds(tr), (every, unit))
+
+    def test_sub_minute_intervals_ask_for_matching_accuracy(self):
+        sec = rv.timer_lines({**rv.DEFAULT_TR, "type": "interval", "every": 20, "unit": "s"}, True, 0)
+        self.assertIn("AccuracySec=1s", sec)
+        self.assertIn("AccuracySec=1s", rv.timer_lines({**rv.DEFAULT_TR, "type": "interval", "every": 90, "unit": "s"}, True, 0))
+        for every, unit in ((1, "min"), (30, "min"), (3, "h")):                    # unchanged for what already worked
+            self.assertNotIn("AccuracySec=1s", rv.timer_lines({**rv.DEFAULT_TR, "type": "interval", "every": every, "unit": unit}, True, 0))
+
+    def test_accuracy_is_replaced_for_seconds_and_a_users_own_value_is_kept_otherwise(self):
+        timer = "[Timer]\nOnCalendar=daily\nAccuracySec=5min\n[Install]\nWantedBy=timers.target\n"
+        write("x.timer", timer)
+        self.assertIsNone(rv.rewrite_timer("x.timer", {**rv.DEFAULT_TR, "hour": 5}, True, 0))
+        self.assertIn("AccuracySec=5min", read(f"{rv.UNITS}/x.timer"))
+        self.assertIsNone(rv.rewrite_timer("x.timer", {**rv.DEFAULT_TR, "type": "interval", "every": 30, "unit": "s"}, True, 0))
+        out = read(f"{rv.UNITS}/x.timer")
+        self.assertEqual(out.count("AccuracySec="), 1); self.assertIn("AccuracySec=1s", out)
+
+    def test_an_empty_interval_is_refused_before_anything_is_written(self):
+        write("x.timer", SIMPLE_TIMER)
+        with self.assertRaises(ValueError):
+            rv.rewrite_timer("x.timer", {**rv.DEFAULT_TR, "type": "interval", "every": 0, "unit": "s"}, True, 0)
+        self.assertEqual(read(f"{rv.UNITS}/x.timer"), SIMPLE_TIMER)
+        self.assertFalse(os.path.exists(f"{rv.UNITS}/x.timer.reveille-bak"))
+
+    def test_a_task_with_a_one_and_a_half_hour_timer_is_editable(self):
+        write("x.service", SIMPLE_SERVICE)
+        write("x.timer", "[Timer]\nOnStartupSec=1h 30min\nOnUnitActiveSec=1h 30min\n[Install]\nWantedBy=timers.target\n")
+        m = rv.load_task("x.timer")
+        self.assertTrue(m["full"]); self.assertEqual((m["trigger"]["every"], m["trigger"]["unit"]), (90, "min"))
+
+
+class Presets(Base):
+    def parse(self, *cals, **kv):
+        kv = {k: [v] for k, v in kv.items()}; kv["OnCalendar"] = list(cals); return rv.parse_schedule(kv)[0]
+
+    def test_weekdays(self):
+        for expr in ("Mon,Tue,Wed,Thu,Fri *-*-* 09:00:00", "Mon..Fri *-*-* 09:00:00", "Mon..Fri 09:00", "Mon..Wed,Thu,Fri 9:00"):
+            tr = self.parse(expr); self.assertEqual((tr["type"], tr["hour"], tr["minute"]), ("weekdays", 9, 0), expr)
+        tr = {**rv.DEFAULT_TR, "type": "weekdays", "hour": 9}
+        self.assertEqual(rv.on_calendar(tr), "Mon,Tue,Wed,Thu,Fri *-*-* 09:00:00")
+        self.assertEqual(rv.timer_lines(tr, False, 0), ["OnCalendar=Mon,Tue,Wed,Thu,Fri *-*-* 09:00:00"])
+
+    def test_weekly_ranges_and_other_day_sets(self):
+        self.assertEqual(self.parse("Sat,Sun *-*-* 10:00:00")["days"], ["Sat", "Sun"])
+        self.assertEqual(self.parse("Mon..Wed,Sat *-*-* 10:00:00")["days"], ["Mon", "Tue", "Wed", "Sat"])
+        self.assertEqual(self.parse("Fri..Mon *-*-* 10:00:00")["type"], "custom")      # a wrapping range: leave it alone
+        self.assertEqual(self.parse("Mon *-*-* 08,12:00:00")["type"], "custom")        # days and several hours at once
+
+    def test_several_times_a_day(self):
+        tr = {**rv.DEFAULT_TR, "type": "times", "times": ["08:00", "12:30", "18:00"]}
+        self.assertEqual(rv.timer_lines(tr, True, 0), ["OnCalendar=*-*-* 08:00:00", "OnCalendar=*-*-* 12:30:00",
+                                                       "OnCalendar=*-*-* 18:00:00", "Persistent=true"])
+        back = self.parse("*-*-* 08:00:00", "*-*-* 12:30:00", "*-*-* 18:00:00")
+        self.assertEqual((back["type"], back["times"]), ("times", ["08:00", "12:30", "18:00"]))
+
+    def test_a_single_line_with_several_hours_is_read_too(self):
+        tr = self.parse("*-*-* 08,12,18:00:00")
+        self.assertEqual((tr["type"], tr["times"]), ("times", ["08:00", "12:00", "18:00"]))
+        self.assertEqual(self.parse("*-*-* 8:00")["type"], "daily")
+        self.assertEqual(self.parse("*-*-* 25:00:00")["type"], "custom")
+
+    def test_repeated_times_collapse(self):
+        tr = self.parse("*-*-* 08:00:00", "*-*-* 08:00:00"); self.assertEqual((tr["type"], tr["hour"]), ("daily", 8))
+
+    def test_time_entry(self):
+        self.assertEqual(rv.parse_times("18:00, 8:05 12:30"), ["08:05", "12:30", "18:00"])
+        self.assertEqual(rv.parse_times("08:00;08:00"), ["08:00"])
+        for bad in ("", "  ", "8", "24:00", "12:60", "08:00, noon", "8:5"): self.assertIsNone(rv.parse_times(bad), bad)
+
+    def test_last_day_of_the_month(self):
+        for expr in ("*-*~01 03:00:00", "*-*~1 03:00"):
+            tr = self.parse(expr); self.assertEqual((tr["type"], tr["hour"]), ("lastday", 3), expr)
+        self.assertEqual(rv.on_calendar({**rv.DEFAULT_TR, "type": "lastday", "hour": 23, "minute": 30}), "*-*~01 23:30:00")
+        self.assertEqual(self.parse("*-*~02 03:00:00")["type"], "custom")                 # the second to last day is not this preset
+
+    def test_the_new_expressions_are_valid_for_systemd(self):
+        if rv.sh("systemd-analyze", "--version") is None: self.skipTest("no systemd-analyze")
+        for tp in ("weekdays", "lastday", "times"):
+            tr = {**rv.DEFAULT_TR, "type": tp}
+            for part in rv.calendar_parts(rv.on_calendar(tr)):
+                r = rv.sh("systemd-analyze", "calendar", part, timeout=5)
+                self.assertEqual(r.returncode, 0, part)
+
+    def test_every_preset_survives_a_save_and_load(self):
+        for tr in ({**rv.DEFAULT_TR, "type": "weekdays", "hour": 6, "minute": 15},
+                   {**rv.DEFAULT_TR, "type": "times", "times": ["07:00", "19:45"]},
+                   {**rv.DEFAULT_TR, "type": "lastday", "hour": 22, "minute": 5}):
+            shutil.rmtree(f"{TMP}/systemd", ignore_errors=True)
+            t = task(trigger=tr); self.assertIsNone(rv.apply_task(t))
+            back = rv.load_task(f"{t['unit']}.timer")["trigger"]
+            self.assertEqual(back["type"], tr["type"])
+            self.assertEqual(rv.on_calendar(back), rv.on_calendar(tr))
+
+    def test_an_empty_schedule_is_refused_not_turned_into_a_login_timer(self):
+        for tr in ({**rv.DEFAULT_TR, "type": "times", "times": []}, {**rv.DEFAULT_TR, "type": "custom", "expr": " "}):
+            with self.assertRaises(ValueError): rv.timer_lines(tr, True, 0)
+        with self.assertRaises(ValueError): rv.apply_task(task(trigger={**rv.DEFAULT_TR, "type": "times", "times": []}))
+        self.assertFalse(os.path.exists(f"{rv.UNITS}/backup.timer"))
+
+
+class RowWording(unittest.TestCase):
+    def d(self, **kw): return rv.describe({**rv.DEFAULT_TR, **kw})
+
+    def test_days(self):
+        self.assertEqual(self.d(type="daily", hour=9), "Every day at 09:00")
+        self.assertEqual(self.d(type="weekdays", hour=9), "Weekdays at 09:00")
+        self.assertEqual(self.d(type="weekly", days=rv.WEEKDAYS, hour=9), "Weekdays at 09:00")
+        self.assertEqual(self.d(type="weekly", days=["Sat", "Sun"], hour=9), "Weekends at 09:00")
+        self.assertEqual(self.d(type="weekly", days=rv.DAYS, hour=9), "Every day at 09:00")
+        self.assertEqual(self.d(type="weekly", days=["Mon", "Thu"], hour=9, minute=30), "Mon, Thu at 09:30")
+
+    def test_months(self):
+        self.assertEqual(self.d(type="monthly", dom=1), "On the 1st of every month at 03:00")
+        self.assertEqual([rv.ordinal(n) for n in (2, 3, 4, 11, 12, 13, 21, 22, 28)],
+                         ["2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "28th"])
+        self.assertEqual(self.d(type="lastday", hour=23), "Last day of every month at 23:00")
+
+    def test_several_times(self):
+        self.assertEqual(self.d(type="times", times=["08:00", "12:30"]), "Every day at 08:00, 12:30")
+
+    def test_intervals(self):
+        for every, unit, text in ((1, "min", "Every minute"), (30, "min", "Every 30 minutes"), (1, "h", "Every hour"),
+                                  (2, "h", "Every 2 hours"), (45, "s", "Every 45 seconds"), (1, "s", "Every second"),
+                                  (1, "d", "Every day"), (3, "d", "Every 3 days")):
+            self.assertEqual(self.d(type="interval", every=every, unit=unit), text)
+
+    def test_a_trigger_from_an_older_version_still_reads(self):
+        self.assertEqual(rv.describe({"type": "interval", "every": 2, "unit": "h"}), "Every 2 hours")
+        self.assertEqual(rv.describe({"type": "login"}), "At login")
+
+    def test_preview_text_for_interval_and_login(self):
+        self.assertEqual(rv.next_elapse({**rv.DEFAULT_TR, "type": "interval", "every": 90, "unit": "min"}),
+                         "First run 90 min after login, then repeats")
+        self.assertEqual(rv.next_elapse({**rv.DEFAULT_TR, "type": "interval", "every": 2, "unit": "d"}),
+                         "First run 2 days after login, then repeats")
+        self.assertEqual(rv.next_elapse({**rv.DEFAULT_TR, "type": "login"}), "Shortly after you log in")
+        self.assertEqual(rv.next_elapse({**rv.DEFAULT_TR, "type": "login", "login_sec": 300}), "5 min after you log in")
 
 
 if __name__ == "__main__":

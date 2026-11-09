@@ -24,12 +24,26 @@ APPS = os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share")
 INSTALLED = f"{APPS}/reveille/reveille"          # stable copy for the app-menu entry
 DESKTOP = f"{APPS}/applications/io.github.reveille.desktop"
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-TRIGGERS = ["Daily", "Weekly", "Monthly", "Every N min/hours", "At login", "Custom"]
-TRIGGER_IDS = ["daily", "weekly", "monthly", "interval", "login", "custom"]
-DEFAULT_TR = {"type": "daily", "hour": 3, "minute": 0, "days": ["Mon"], "dom": 1, "every": 30, "unit": "min", "expr": ""}
+WEEKDAYS = DAYS[:5]
+TRIGGERS = ["Daily", "Weekdays", "Weekly", "Monthly", "Last day of the month", "Several times a day",
+            "At an interval", "At login", "Custom"]
+TRIGGER_IDS = ["daily", "weekdays", "weekly", "monthly", "lastday", "times", "interval", "login", "custom"]
+CALENDAR_TYPES = {"daily", "weekdays", "weekly", "monthly", "lastday", "times", "custom"}   # the ones written as OnCalendar=
+INTERVAL_UNITS = {"s": 1, "min": 60, "h": 3600, "d": 86400}      # in seconds; the editor offers them in this order
+EVERY_NAMES = {"s": ("second", "seconds"), "min": ("minute", "minutes"), "h": ("hour", "hours"), "d": ("day", "days")}
+MAX_EVERY = 9999                    # what the "Every" box can hold; a longer interval isn't shown, so it isn't edited
+DEFAULT_TR = {"type": "daily", "hour": 3, "minute": 0, "days": ["Mon"], "dom": 1, "every": 30, "unit": "min", "expr": "",
+              "times": ["09:00", "17:00"], "login_sec": 10}
 
 SCHEDULE_KEYS = ("OnCalendar", "OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnActiveSec", "OnUnitInactiveSec",
                  "Persistent", "RandomizedDelaySec")
+TIMER_KEYS = set(SCHEDULE_KEYS) | {"AccuracySec"}              # what a save of the schedule may rewrite
+# Settings the editor manages in the service. A drop-in that sets one of them makes what the editor shows untrue.
+UNIT_KEYS = {"ConditionACPower", "Wants", "After", "ConditionPathExists", "OnSuccess", "OnFailure",
+             "StartLimitIntervalSec", "StartLimitBurst"}
+SERVICE_KEYS = {"WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice", "IOSchedulingClass"}
+SERVICE_DROPIN_KEYS = {"Unit": UNIT_KEYS, "Service": SERVICE_KEYS | {"ExecStart", "KillMode"}}
+TIMER_DROPIN_KEYS = {"Timer": set(SCHEDULE_KEYS) | {"Unit"}, "Unit": {"Description"}}
 ONLINE = "network-online.target"
 BOOT_OK = {"enabled", "enabled-runtime", "indirect", "alias"}     # UnitFileState values that survive a restart
 
@@ -150,6 +164,48 @@ def parse_span_f(text):
         total += float(n) * SPAN_UNITS[u]
     return total
 
+def exact_span(text):
+    """A time span as whole seconds, or None if it isn't one or has a fraction of a second (parse_span would
+    quietly round that down, and a saved schedule must mean what was written)."""
+    f = parse_span_f(text)
+    return int(f) if f is not None and f == int(f) else None
+
+def fmt_span(secs):
+    """Whole seconds as the shortest exact systemd span: 7200 -> "2h", 5400 -> "90min", 45 -> "45s"."""
+    if secs == 0: return "0"
+    for suffix, size in (("d", 86400), ("h", 3600), ("min", 60)):
+        if secs % size == 0: return f"{secs // size}{suffix}"
+    return f"{secs}s"
+
+def split_interval(secs):
+    """(n, unit) with the largest unit that divides `secs` evenly, or None if that doesn't fit the editor."""
+    for unit in ("d", "h", "min", "s"):
+        if secs % INTERVAL_UNITS[unit] == 0:
+            n = secs // INTERVAL_UNITS[unit]
+            return (n, unit) if 1 <= n <= MAX_EVERY else None
+    return None
+
+def interval_seconds(tr):
+    return int(tr.get("every", 1)) * INTERVAL_UNITS.get(tr.get("unit"), 60)
+
+def human_span(secs):
+    """"90 s", "5 min", "2 h", "3 days" """
+    n, unit = split_interval(secs) or (secs, "s")
+    return f"{n} " + ({"s": "s", "min": "min", "h": "h"}.get(unit) or ("day" if n == 1 else "days"))
+
+def ordinal(n):
+    return f"{n}" + ("th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th"))
+
+def parse_times(text):
+    """"8:00, 12:30 18:00" -> ["08:00", "12:30", "18:00"] (sorted, no repeats), or None if it is empty or
+    anything in it isn't a clock time."""
+    out = set()
+    for p in (x for x in re.split(r"[,;|\s]+", text.strip()) if x):
+        m = re.fullmatch(r"(\d{1,2}):(\d\d)", p)
+        if not m or int(m[1]) > 23 or int(m[2]) > 59: return None
+        out.add(f"{int(m[1]):02d}:{m[2]}")
+    return sorted(out) or None
+
 def parse_ts(text):
     """A timestamp as systemctl prints it ("Tue 2026-11-10 03:00:00 -03", local time) as epoch seconds, or None."""
     m = re.search(r"(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)", text or "")
@@ -221,11 +277,17 @@ def on_calendar(tr):
     t = tr["type"]
     if t == "daily":
         return f"*-*-* {h:02d}:{m:02d}:00"
+    if t == "weekdays":
+        return f"{','.join(WEEKDAYS)} *-*-* {h:02d}:{m:02d}:00"
     if t == "weekly":
         days = ",".join(d for d in DAYS if d in tr.get("days", []))
         return f"{days} *-*-* {h:02d}:{m:02d}:00"
     if t == "monthly":
         return f"*-*-{int(tr.get('dom', 1)):02d} {h:02d}:{m:02d}:00"
+    if t == "lastday":
+        return f"*-*~01 {h:02d}:{m:02d}:00"
+    if t == "times":                                    # one OnCalendar= line each, so the minutes can differ
+        return " | ".join(f"*-*-* {x}:00" for x in tr.get("times") or []) or None
     if t == "custom":
         return tr.get("expr", "").strip() or None
     return None
@@ -233,11 +295,21 @@ def on_calendar(tr):
 def describe(tr):
     t, hm = tr["type"], f"{int(tr.get('hour', 0)):02d}:{int(tr.get('minute', 0)):02d}"
     if t == "daily": return f"Every day at {hm}"
-    if t == "weekly": return f"{', '.join(d for d in DAYS if d in tr.get('days', []))} at {hm}"
-    if t == "monthly": return f"Day {tr.get('dom', 1)} of every month at {hm}"
+    if t == "weekdays": return f"Weekdays at {hm}"
+    if t == "weekly":
+        days = [d for d in DAYS if d in tr.get("days", [])]
+        who = ("Every day" if len(days) == 7 else "Weekdays" if days == WEEKDAYS else
+               "Weekends" if days == DAYS[5:] else ", ".join(days))
+        return f"{who} at {hm}"
+    if t == "monthly": return f"On the {ordinal(int(tr.get('dom', 1)))} of every month at {hm}"
+    if t == "lastday": return f"Last day of every month at {hm}"
+    if t == "times": return "Every day at " + ", ".join(tr.get("times") or [hm])
     if t == "custom": return tr.get("expr", "custom schedule")
-    if t == "interval": return f"Every {tr.get('every', 1)} {'hours' if tr.get('unit') == 'h' else 'minutes'}"
-    return "At login"
+    if t == "interval":
+        one, many = EVERY_NAMES.get(tr.get("unit"), EVERY_NAMES["min"]); n = int(tr.get("every", 1))
+        return f"Every {one}" if n == 1 else f"Every {n} {many}"
+    sec = int(tr.get("login_sec", 10))
+    return "At login" if sec in (0, 10) else f"At login, after {human_span(sec)}"
 
 def calendar_parts(expr):
     """A custom schedule may hold several calendar expressions separated by | (one OnCalendar= line each)."""
@@ -259,31 +331,81 @@ def next_elapse(tr):
             res.append(nxt.group(1).strip() + (f"  ({left.group(1).strip()})" if left else ""))
         return "\n".join(res) if res else "Not a valid schedule"
     if tr["type"] == "interval":
-        return f"First run {tr['every']} {'h' if tr['unit'] == 'h' else 'min'} after login, then repeats"
-    return "Shortly after you log in"
+        return f"First run {human_span(interval_seconds(tr))} after login, then repeats"
+    sec = int(tr.get("login_sec", 10))
+    return "Shortly after you log in" if sec <= 60 else f"{human_span(sec)} after you log in"
+
+def needs_precision(secs):
+    """systemd lets a timer fire up to a minute late (AccuracySec=1min) so wake-ups can be shared. An interval
+    that isn't a whole number of minutes would be off by a large share of its length."""
+    return secs < 60 or secs % 60 != 0
 
 def timer_lines(tr, catchup, delay):
+    """The schedule lines of a timer. Raises ValueError if the schedule is empty, so nothing is half-written."""
     out, cal = [], on_calendar(tr)
-    if cal:
+    if tr["type"] in CALENDAR_TYPES:
+        if not cal: raise ValueError("The schedule is empty")
         out += [f"OnCalendar={p}" for p in calendar_parts(cal)]
         if catchup: out.append("Persistent=true")
     elif tr["type"] == "interval":
-        step = f"{int(tr['every'])}{'h' if tr['unit'] == 'h' else 'min'}"
-        out += [f"OnStartupSec={step}", f"OnUnitActiveSec={step}"]
+        secs = interval_seconds(tr)
+        if secs < 1: raise ValueError("The interval must be at least one second")
+        out += [f"OnStartupSec={fmt_span(secs)}", f"OnUnitActiveSec={fmt_span(secs)}"]
+        if needs_precision(secs): out.append("AccuracySec=1s")
     else:
-        out.append("OnStartupSec=10s")
+        out.append(f"OnStartupSec={fmt_span(int(tr.get('login_sec', 10)))}")
     if delay: out.append(f"RandomizedDelaySec={int(delay)}")
     return out
 
+def timer_keep(tr):
+    """keep(key, value) for the [Timer] section: AccuracySec= is the user's own, except for an interval that
+    needs the precise one, where the editor writes it itself."""
+    precise = tr["type"] == "interval" and needs_precision(interval_seconds(tr))
+    return lambda k, v: k == "AccuracySec" and not precise
+
+DAY_RE = "|".join(DAYS)
+
+def parse_days(spec):
+    """"Mon,Wed" or "Mon..Fri,Sun" as a list of days in week order, or None if it isn't that."""
+    days = set()
+    for part in spec.split(","):
+        m = re.fullmatch(rf"({DAY_RE})(?:\.\.({DAY_RE}))?", part)
+        if not m: return None
+        a = DAYS.index(m[1]); b = DAYS.index(m[2]) if m[2] else a
+        if b < a: return None
+        days.update(DAYS[a:b + 1])
+    return [d for d in DAYS if d in days]
+
+def times_of(tr):
+    """The clock times of a daily or several-times trigger as ["HH:MM", ...], else None."""
+    if tr["type"] == "daily": return [f"{tr['hour']:02d}:{tr['minute']:02d}"]
+    if tr["type"] == "times": return tr["times"]
+    return None
+
 def from_calendar(expr):
-    e, hm = expr.strip(), r"(\d\d?):(\d\d)(?::00)?"
+    e = expr.strip()
     if e == "daily": return {"type": "daily", "hour": 0, "minute": 0}
-    m = re.fullmatch(rf"\*-\*-\* {hm}", e)
-    if m: return {"type": "daily", "hour": int(m[1]), "minute": int(m[2])}
-    m = re.fullmatch(rf"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:,(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun))*) \*-\*-\* {hm}", e)
-    if m: return {"type": "weekly", "days": m[1].split(","), "hour": int(m[2]), "minute": int(m[3])}
-    m = re.fullmatch(rf"\*-\*-(\d\d?) {hm}", e)
-    if m and 1 <= int(m[1]) <= 28: return {"type": "monthly", "dom": int(m[1]), "hour": int(m[2]), "minute": int(m[3])}
+    date, clock = r"(?:\*-\*-\* )?", r"(\d\d?(?:,\d\d?)*):(\d\d)(?::00)?"
+    def at(hours, minute):                              # "8,12", "30" -> ([8, 12], 30), or None if out of range
+        hs = sorted({int(x) for x in hours.split(",")})
+        return (hs, int(minute)) if hs[-1] < 24 and int(minute) < 60 else None
+    m = re.fullmatch(rf"{date}{clock}", e)
+    t = at(m[1], m[2]) if m else None
+    if t:
+        (hs, mi) = t
+        if len(hs) == 1: return {"type": "daily", "hour": hs[0], "minute": mi}
+        return {"type": "times", "times": [f"{h:02d}:{mi:02d}" for h in hs]}
+    m = re.fullmatch(rf"([A-Za-z.,]+) {date}{clock}", e)
+    days, t = (parse_days(m[1]), at(m[2], m[3])) if m else (None, None)
+    if days and t and len(t[0]) == 1:
+        return {"type": "weekdays" if days == WEEKDAYS else "weekly", "days": days, "hour": t[0][0], "minute": t[1]}
+    m = re.fullmatch(rf"\*-\*-(\d\d?) {clock}", e)
+    t = at(m[2], m[3]) if m else None
+    if t and len(t[0]) == 1 and 1 <= int(m[1]) <= 28:
+        return {"type": "monthly", "dom": int(m[1]), "hour": t[0][0], "minute": t[1]}
+    m = re.fullmatch(rf"\*-\*~0?1 {clock}", e)
+    t = at(m[1], m[2]) if m else None
+    if t and len(t[0]) == 1: return {"type": "lastday", "hour": t[0][0], "minute": t[1]}
     return {"type": "custom", "expr": e}
 
 def parse_schedule(kv):
@@ -299,13 +421,24 @@ def parse_schedule(kv):
     if len(cals) == 1 and not start and not active:
         tr = from_calendar(cals[0])
     elif len(cals) > 1 and not start and not active:
-        tr = {"type": "custom", "expr": " | ".join(cals)}
+        parts = [from_calendar(c) for c in cals]
+        lists = [times_of(p) for p in parts]
+        if all(lists):                                  # several clock times: one OnCalendar= line each
+            ts = sorted({x for l in lists for x in l})
+            tr = ({"type": "times", "times": ts} if len(ts) > 1 else
+                  {"type": "daily", "hour": int(ts[0][:2]), "minute": int(ts[0][3:])})
+        else:
+            tr = {"type": "custom", "expr": " | ".join(cals)}
     elif not cals and len(active) == 1 and len(start) <= 1:
-        m = re.fullmatch(r"(\d+)\s*(min|m|minutes?|h|hr|hours?)", active[0])
-        if not m or (start and start[0] != active[0]): return None
-        tr = {"type": "interval", "every": int(m[1]), "unit": "h" if m[2][0] == "h" else "min"}
-    elif not cals and not active and len(start) == 1 and re.fullmatch(r"\d+\s*s(ec)?", start[0]):
-        tr = {"type": "login"}
+        total = exact_span(active[0])
+        if not total or (start and exact_span(start[0]) != total): return None
+        step = split_interval(total)
+        if not step: return None
+        tr = {"type": "interval", "every": step[0], "unit": step[1]}
+    elif not cals and not active and len(start) == 1:
+        sec = exact_span(start[0])
+        if sec is None: return None
+        tr = {"type": "login", "login_sec": sec}
     else:
         return None
     return {**DEFAULT_TR, **tr}, catchup, delay
@@ -313,12 +446,12 @@ def parse_schedule(kv):
 def rewrite_timer(unit, tr, catchup, delay):
     """Replace only the schedule lines of a hand-written timer; everything else in the file is kept."""
     path = unit_path(unit)
+    lines = timer_lines(tr, catchup, delay)             # before anything is written: it can refuse
     try:
         with open(path) as f: text = f.read()
         if not os.path.exists(path + ".reveille-bak"):          # one-time backup of the original
             write_atomic(path + ".reveille-bak", text)
-        write_atomic(path, merge_unit(text, {"Timer": (set(SCHEDULE_KEYS), timer_lines(tr, catchup, delay),
-                                                       lambda k, v: False)}))
+        write_atomic(path, merge_unit(text, {"Timer": (TIMER_KEYS, lines, timer_keep(tr))}))
     except OSError as e:
         return e.strerror or str(e)
     ctl("daemon-reload")
@@ -383,11 +516,14 @@ def parse_service(name):
     if len(paths) > 1: return {"why": "there are several ConditionPathExists= lines"}
     then = [x for v in un.get("OnSuccess", []) for x in v.split()]
     if len(then) > 1: return {"why": "OnSuccess= lists more than one unit"}
+    fail = [x for v in un.get("OnFailure", []) for x in v.split()]
+    if len(fail) > 1: return {"why": "OnFailure= lists more than one unit"}
     adv = {"cwd": unesc(sv.get("WorkingDirectory", [""])[-1]), "env": " ".join(shlex.quote(x) for x in env),
            "timeout": timeout, "ac": "true" in un.get("ConditionACPower", []), "online": ONLINE in deps,
            "retries": retries, "retry_wait": wait,
            "low": sv.get("Nice") == ["19"] and sv.get("IOSchedulingClass") == ["idle"],
-           "path": unesc(paths[0]) if paths else "", "then": then[0] if then else ""}
+           "path": unesc(paths[0]) if paths else "", "then": then[0] if then else "",
+           "fail": fail[0] if fail else ""}
     s = {"adv": adv, "kind": "command", "command": cmd}
     if len(tokens) == 3 and os.path.basename(tokens[0]) == "gio" and tokens[1] == "launch":
         s.update(kind="app", app=os.path.basename(tokens[2]))
@@ -402,7 +538,8 @@ def retry_window(retries, wait_min, timeout_min=0):
     return (retries + 1) * (wait_min + (timeout_min or 60)) * 60 + 60
 
 def then_cycle(service, then):
-    """True if starting `then` after `service` succeeds would lead back to `service` through OnSuccess= links."""
+    """True if starting `then` after `service` succeeds (OnSuccess=) or fails (OnFailure=) would lead back to
+    `service` through such links. Either kind of link can close the loop, so both are followed."""
     seen, todo = set(), [then]
     while todo:
         cur = todo.pop()
@@ -410,8 +547,27 @@ def then_cycle(service, then):
         if cur in seen or not cur: continue
         seen.add(cur)
         u = read_unit(unit_path(cur)) or {}
-        todo += [x for v in u.get("Unit", {}).get("OnSuccess", []) for x in v.split()]
+        todo += [x for k in ("OnSuccess", "OnFailure") for v in u.get("Unit", {}).get(k, []) for x in v.split()]
     return False
+
+def dropin_info(unit, watched):
+    """The drop-in files of `unit` ("NAME.service.d/x.conf", from the user unit folder) and, if one of them sets a key
+    in `watched` ({section: keys}), a reason saying which; "" if none does. Such a key is one the editor shows,
+    so what it shows would no longer be what systemd runs."""
+    folder = f"{UNITS}/{unit}.d"
+    try: names = sorted(n for n in os.listdir(folder) if n.endswith(".conf") and os.path.isfile(f"{folder}/{n}"))
+    except OSError: return [], ""
+    why = []
+    for n in names:
+        u = read_unit(f"{folder}/{n}") or {}
+        hit = []
+        for sect, keys in watched.items():
+            for k, vals in u.get(sect, {}).items():
+                if k not in keys: continue
+                if k in ("Wants", "After") and not any(ONLINE in v.split() for v in vals): continue   # only the network one is ours
+                hit.append(f"{k}=")
+        if hit: why.append(f"the drop-in {unit}.d/{n} also sets {', '.join(sorted(hit))}")
+    return [f"{unit}.d/{n}" for n in names], "; ".join(why)
 
 def load_task(timer, status=None):
     """Build a task from a timer file (and the service it starts). "full" means the editor can rewrite it."""
@@ -419,19 +575,23 @@ def load_task(timer, status=None):
     if u is None: return None
     tk, base = u.get("Timer", {}), timer[:-6]
     target = (tk.get("Unit") or [base + ".service"])[0]
-    sched = parse_schedule(tk)
+    files, why = dropin_info(timer, TIMER_DROPIN_KEYS)
+    sched = None if why else parse_schedule(tk)         # a drop-in that changes the schedule: the file isn't the whole truth
     desc = unesc((u.get("Unit", {}).get("Description") or [""])[0])
     m = {"timer": timer, "unit": base, "service": target, "name": desc or base, "kind": "service", "full": False,
          "trigger": sched[0] if sched else None, "catchup": sched[1] if sched else True,
-         "adv": {"delay": sched[2] if sched else 0},
+         "adv": {"delay": sched[2] if sched else 0}, "dropins": files,
          # "enabled" means the timer is active (will fire); "fstate" says whether it also survives a restart
          "enabled": (status[timer].get("ActiveState") == "active" if status is not None and timer in status
                      else unit_status(timer)[1]),
          "fstate": status[timer].get("UnitFileState", "") if status is not None and timer in status else ""}
+    if why: m["why"] = why
     if not sched: return m
     if target == base + ".service" and os.path.isfile(f"{UNITS}/{target}"):
+        sfiles, swhy = dropin_info(target, SERVICE_DROPIN_KEYS)
+        m["dropins"] = files + sfiles
         s = parse_service(target)
-        if "why" in s: m["why"] = s["why"]; return m
+        if swhy or "why" in s: m["why"] = swhy or s["why"]; return m
         m.update(kind=s["kind"], app=s.get("app", ""), command=s.get("command", ""),
                  adv={**s["adv"], "delay": sched[2]})
     m["full"] = True
@@ -503,6 +663,7 @@ def unit_texts(t, old_service="", old_timer=""):
         if adv.get("online"): unit += [f"Wants={ONLINE}", f"After={ONLINE}"]
         if adv.get("path"): unit.append(f"ConditionPathExists={esc(adv['path'])}")
         if adv.get("then"): unit.append(f"OnSuccess={adv['then']}")
+        if adv.get("fail"): unit.append(f"OnFailure={adv['fail']}")
         retries = int(adv.get("retries") or 0)
         wait = max(1, int(adv.get("retry_wait") or 5))
         if retries: unit += [f"StartLimitIntervalSec={retry_window(retries, wait, adv.get('timeout') or 0)}",
@@ -523,17 +684,15 @@ def unit_texts(t, old_service="", old_timer=""):
             if k in ("Wants", "After"): return set(v.split()) != {ONLINE}
             return False
         service = merge_unit(old_service, {
-            "Unit": ({"ConditionACPower", "Wants", "After", "ConditionPathExists", "OnSuccess", "StartLimitIntervalSec",
-                      "StartLimitBurst"} | ({"Description"} if desc else set()), unit, keep_unit),
-            "Service": ({"WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice",
-                         "IOSchedulingClass"} | (set() if keep_exec else {"ExecStart"})
+            "Unit": (UNIT_KEYS | ({"Description"} if desc else set()), unit, keep_unit),
+            "Service": (SERVICE_KEYS | (set() if keep_exec else {"ExecStart"})
                         | ({"KillMode"} if t["kind"] == "app" else set()),
                         svc, keep_svc)})
     timer = merge_unit(old_timer, {
         "Unit": ({"Description"} if desc else set(), [f"Description={esc(name)}"] if desc else [], never),
-        "Timer": (set(SCHEDULE_KEYS) | {"Unit"},
+        "Timer": (TIMER_KEYS | {"Unit"},
                   ([f"Unit={t['service']}"] if t["kind"] == "service" else [])
-                  + timer_lines(tr, t.get("catchup", True), adv.get("delay", 0)), never),
+                  + timer_lines(tr, t.get("catchup", True), adv.get("delay", 0)), timer_keep(tr)),
         "Install": ({"WantedBy"}, ["WantedBy=timers.target"], lambda k, v: v != "timers.target")})
     return service, timer
 
@@ -726,7 +885,8 @@ def task_texts(m):
 
 def gather():
     """Everything the window lists, fetched with two systemctl calls however many tasks there are.
-    No GTK in here, so it can run off the main thread."""
+    The service list for the editor's pickers is not part of it (list_services is the costly one): the window
+    fetches it when an editor opens. No GTK in here, so it can run off the main thread."""
     timers = user_timers()
     st = show_many(timers, "ActiveState", "UnitFileState", "NextElapseUSecRealtime", "NextElapseUSecMonotonic")
     tasks = [m for m in (load_task(t, st) for t in timers) if m]
@@ -744,8 +904,8 @@ def gather():
         m["retrying"] = svc.get("SubState") == "auto-restart"          # failed, waiting for the next try
         m["running"] = svc.get("ActiveState") in ("activating", "active") and not m["retrying"]
     tasks.sort(key=lambda m: m["name"].lower())
-    return {"tasks": tasks, "free": unscheduled_services(timers), "services": list_services(),
-            "linger": linger_state(), "systemd": systemd_version()}
+    return {"tasks": tasks, "free": unscheduled_services(timers), "linger": linger_state(),
+            "systemd": systemd_version()}
 
 
 # ---------------------------------------------------------------- app menu
@@ -813,6 +973,12 @@ def gui():
             note = Adw.PreferencesGroup(title="Only the schedule can be edited",
                                         description=GLib.markup_escape_text(f"Because {why}.") if why else "")
             note.set_visible(not self.full and bool(why)); page.add(note)
+            drop = (m or {}).get("dropins") or []
+            if drop and self.full:                         # not restricted, but worth knowing about
+                page.add(Adw.PreferencesGroup(
+                    title="Drop-in overrides",
+                    description=GLib.markup_escape_text(
+                        "systemd also applies these files. The editor doesn't read or change them:\n" + "\n".join(drop))))
             g = Adw.PreferencesGroup(title="General"); page.add(g)
             self.name = Adw.EntryRow(title="Name", text=t.get("name", "")); g.add(self.name)
             self.own_groups = [g]                          # hidden when only the schedule is editable
@@ -830,7 +996,7 @@ def gui():
             self.app.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
             self.app.set_selected(sel)
             g.add(self.app)
-            found = win.services or list_services()
+            found = win.services                           # fetched by Win.edit just before this editor opened
             self.services, sel = pick_list(found, t.get("service") if t["kind"] == "service" else None)
             self.svc = Adw.ComboRow(title="Service", subtitle=f"{len(found)} user services found",
                                     enable_search=True, model=Gtk.StringList.new(self.services))
@@ -851,9 +1017,12 @@ def gui():
             self.hour = Adw.SpinRow.new_with_range(0, 23, 1); self.hour.set_title("Hour"); self.hour.set_value(tr["hour"])
             self.minute = Adw.SpinRow.new_with_range(0, 59, 1); self.minute.set_title("Minute"); self.minute.set_value(tr["minute"])
             self.dom = Adw.SpinRow.new_with_range(1, 28, 1); self.dom.set_title("Day of month"); self.dom.set_value(tr["dom"])
-            self.every = Adw.SpinRow.new_with_range(1, 999, 1); self.every.set_title("Every"); self.every.set_value(tr["every"])
-            self.unit = Adw.ComboRow(title="Unit", model=Gtk.StringList.new(["minutes", "hours"]),
-                                     selected=1 if tr["unit"] == "h" else 0)
+            self.every = Adw.SpinRow.new_with_range(1, MAX_EVERY, 1); self.every.set_title("Every"); self.every.set_value(tr["every"])
+            self.unit = Adw.ComboRow(title="Unit", model=Gtk.StringList.new([EVERY_NAMES[u][1] for u in INTERVAL_UNITS]),
+                                     selected=list(INTERVAL_UNITS).index(tr["unit"]) if tr["unit"] in INTERVAL_UNITS else 1)
+            self.login_sec = tr["login_sec"]               # not editable here, but a hand-set delay must survive a save
+            self.times = Adw.EntryRow(title="Times (e.g. 08:00, 12:30, 18:00)", text=", ".join(tr["times"]))
+            self.times.connect("changed", self.refresh)
             self.days_row = Adw.ActionRow(title="Days")
             box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER); self.day_btns = {}
             for d in DAYS:
@@ -862,12 +1031,13 @@ def gui():
             self.days_row.add_suffix(box)
             self.expr = Adw.EntryRow(title="Calendar expression (e.g. Mon..Fri 09:00; separate several with |)", text=tr["expr"])
             self.expr.connect("changed", self.refresh)
-            self.when = [self.hour, self.minute, self.days_row, self.dom, self.every, self.unit, self.expr]
+            self.when = [self.hour, self.minute, self.days_row, self.dom, self.times, self.every, self.unit, self.expr]
             for r in self.when: g.add(r)
             self.preview = Adw.ActionRow(title="Next run", subtitle_selectable=True)
             self.preview.add_css_class("property"); g.add(self.preview)
 
             g = Adw.PreferencesGroup(title="Options"); page.add(g)
+            self.opts = g
             self.catchup = Adw.SwitchRow(title="Run missed tasks after startup",
                                          subtitle="If the computer was off at the scheduled time",
                                          active=t.get("catchup", True))
@@ -894,19 +1064,24 @@ def gui():
                                      subtitle="Lowest CPU and disk priority, so it doesn't slow down your work")
             self.path = Adw.EntryRow(title="Only if this path exists (start with ! to require it missing)",
                                      text=adv.get("path", ""))
-            cur = adv.get("then", "")
-            items, sel = pick_list([x for x in found if x != (m or {}).get("service")], cur)
-            self.then_opts = [""] + items
-            self.then = Adw.ComboRow(title="Then run", subtitle="A service to start after this one succeeds",
-                                     enable_search=True, model=Gtk.StringList.new(["None"] + items))
-            self.then.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
-            self.then.set_selected(sel + 1 if cur else 0)
+            others = [x for x in found if x != (m or {}).get("service")]
+            def picker(title, subtitle, cur):              # "None" plus the services; a current value that isn't listed stays
+                items, sel = pick_list(others, cur)
+                row = Adw.ComboRow(title=title, subtitle=subtitle, enable_search=True,
+                                   model=Gtk.StringList.new(["None"] + items))
+                row.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
+                row.set_selected(sel + 1 if cur else 0)
+                return row, [""] + items
+            self.then, self.then_opts = picker("Then run", "A service to start after this one succeeds", adv.get("then", ""))
+            self.fail, self.fail_opts = picker("If it fails, run",
+                                               "A service to start when this one fails (after the last retry, if any)",
+                                               adv.get("fail", ""))
             if sd is not None and sd < 244:
                 self.retries.set_sensitive(False); self.retries.set_subtitle(f"Needs systemd 244 or newer (this is {sd})")
             if sd is not None and sd < 249:
                 self.then.set_sensitive(False); self.then.set_subtitle(f"Needs systemd 249 or newer (this is {sd})")
             self.own_only = [self.cwd, self.env, self.timeout, self.ac, self.online, self.retries, self.retry_wait,
-                             self.low, self.path, self.then]   # don't apply to an existing service
+                             self.low, self.path, self.then, self.fail]   # don't apply to an existing service
             for r in self.own_only + [self.delay]: g.add(r)
 
             # Delete lives inside the item: a task's timer, or a service without a timer opened via its row
@@ -935,7 +1110,8 @@ def gui():
             return {"type": tp, "expr": self.expr.get_text().strip(), "hour": int(self.hour.get_value()), "minute": int(self.minute.get_value()),
                     "days": [d for d, b in self.day_btns.items() if b.get_active()],
                     "dom": int(self.dom.get_value()), "every": int(self.every.get_value()),
-                    "unit": "h" if self.unit.get_selected() == 1 else "min"}
+                    "unit": list(INTERVAL_UNITS)[self.unit.get_selected()],
+                    "times": parse_times(self.times.get_text()) or [], "login_sec": self.login_sec}
 
         def refresh(self, *_):
             k = self.kind.get_selected()
@@ -945,13 +1121,20 @@ def gui():
             if not self.full:                              # only the schedule of a hand-written timer is editable
                 for r in (self.name, self.kind, self.app, self.cmd, self.svc, self.enabled, *self.own_only, *self.own_groups):
                     r.set_visible(False)
-            tp = self.trig.get_selected()
-            show = {self.hour: tp in (0, 1, 2), self.minute: tp in (0, 1, 2), self.days_row: tp == 1,
-                    self.dom: tp == 2, self.every: tp == 3, self.unit: tp == 3, self.expr: tp == 5}
+            tp = TRIGGER_IDS[self.trig.get_selected()]
+            clock = tp in ("daily", "weekdays", "weekly", "monthly", "lastday")
+            show = {self.hour: clock, self.minute: clock, self.days_row: tp == "weekly", self.dom: tp == "monthly",
+                    self.times: tp == "times", self.every: tp == "interval", self.unit: tp == "interval",
+                    self.expr: tp == "custom"}
             for w, v in show.items(): w.set_visible(v)
+            # "Run missed tasks" only means something for a calendar schedule: an interval or a login has no missed time
+            self.catchup.set_visible(tp in CALENDAR_TYPES)
+            self.opts.set_visible(self.catchup.get_visible() or self.enabled.get_visible())
             tr = self.trigger()
-            if tp == 1 and not tr["days"]:
+            if tp == "weekly" and not tr["days"]:
                 self.preview.set_subtitle("Pick at least one day")
+            elif tp == "times" and not tr["times"]:
+                self.preview.set_subtitle("Enter times like 08:00, 12:30")
             else:                                          # systemd-analyze runs off the main thread, after a pause
                 if self._pv_src: GLib.source_remove(self._pv_src)
                 self._pv_src = GLib.timeout_add(250, self.run_preview, tr)
@@ -971,6 +1154,7 @@ def gui():
             if tr["type"] == "custom" and not calendar_parts(tr["expr"]):
                 return self.win.toast("That is not a valid calendar expression")
             if tr["type"] == "weekly" and not tr["days"]: return self.win.toast("Pick at least one day")
+            if tr["type"] == "times" and not tr["times"]: return self.win.toast("Enter times like 08:00, 12:30")
             if not self.full:
                 timer, catchup, delay = self.m["timer"], self.catchup.get_active(), int(self.delay.get_value())
                 return self.run_save("sched", tr, lambda: rewrite_timer(timer, tr, catchup, delay))
@@ -987,7 +1171,8 @@ def gui():
                          "online": self.online.get_active(), "delay": int(self.delay.get_value()),
                          "retries": int(self.retries.get_value()), "retry_wait": int(self.retry_wait.get_value()),
                          "low": self.low.get_active(), "path": self.path.get_text().strip(),
-                         "then": self.then_opts[self.then.get_selected()]}}
+                         "then": self.then_opts[self.then.get_selected()],
+                         "fail": self.fail_opts[self.fail.get_selected()]}}
             if k == 0:
                 if not self.app_ids: return self.win.toast("No applications found")
                 t["app"] = self.app_ids[self.app.get_selected()]
@@ -999,7 +1184,7 @@ def gui():
             adv = t["adv"]
             if k != 2 and adv["retries"] and tr["type"] == "interval":      # a retry window longer than the interval
                 window = retry_window(adv["retries"], adv["retry_wait"], adv["timeout"])
-                if tr["every"] * (3600 if tr["unit"] == "h" else 60) <= window:
+                if interval_seconds(tr) <= window:
                     return self.win.toast(f"Retries need a schedule longer than about {window // 60} min")
             if self.m:                              # editing in place: leave untouched what the user didn't change
                 t["old_name"] = self.m["name"]
@@ -1007,7 +1192,7 @@ def gui():
                 t["keep_exec"] = same and ["app", "command", "service"][k] == self.m["kind"]
             def job():                              # systemctl and unit-name lookups run off the main thread
                 t["unit"] = self.m["unit"] if self.m else unique_base(name)
-                if k != 2 and t["adv"]["then"] and then_cycle(t["unit"] + ".service", t["adv"]["then"]):
+                if k != 2 and any(t["adv"][x] and then_cycle(t["unit"] + ".service", t["adv"][x]) for x in ("then", "fail")):
                     raise ValueError("That would make tasks run each other in a loop")
                 return apply_task(t)
             self.run_save("task", tr, job)
@@ -1049,10 +1234,13 @@ def gui():
         def __init__(self, win, m):
             super().__init__(title=m["name"], content_width=560, content_height=560)
             page = Adw.PreferencesPage()
+            why = m.get("why")
             page.add(Adw.PreferencesGroup(
                 title="Only the file can be edited",
-                description="This timer uses schedule options the editor can't show, so reveille leaves it alone. "
-                            "You can open the file in your editor, or delete the task."))
+                description=GLib.markup_escape_text(
+                    (f"Because {why}, the editor can't show this schedule" if why else
+                     "This timer uses schedule options the editor can't show")
+                    + ", so reveille leaves it alone. You can open the file in your editor, or delete the task.")))
             g = Adw.PreferencesGroup(title=GLib.markup_escape_text(m["timer"])); page.add(g)
             tv = Gtk.TextView(editable=False, cursor_visible=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
                               top_margin=8, bottom_margin=8, left_margin=8, right_margin=8)
@@ -1198,6 +1386,7 @@ def gui():
             self.stack.add_named(empty, "empty"); self.stack.add_named(Gtk.ScrolledWindow(child=clamp), "list")
             tv.set_content(self.stack); self.overlay.set_child(tv); self.set_content(self.overlay)
             self.services, self.busy, self.again, self.shape, self.has_tasks = [], False, False, None, False
+            self.opening = False
             self.sdver = None
             self.cur, self.rows, self.syncing = {}, {}, False
             self.stack.set_visible_child_name("loading")
@@ -1260,8 +1449,16 @@ def gui():
         def edit(self, m, preset=None):
             if m and m["trigger"] is None:
                 RawView(self, m).present(self)
-            else:
-                Editor(self, m, preset).present(self)
+                return
+            if self.opening: return                        # a second click while the first editor is on its way
+            self.opening = True
+            def done(found):                               # the service pickers are filled now, not on every refresh
+                self.opening = False
+                if not isinstance(found, Exception): self.services = found
+                cur = self.cur.get(m["timer"], m) if m else None      # rows live on: use the latest data
+                if cur and cur["trigger"] is None: RawView(self, cur).present(self)
+                else: Editor(self, cur, preset).present(self)
+            self.bg(list_services, done)
 
         def ask_delete(self, name):
             names = delete_plan(name)
@@ -1370,7 +1567,7 @@ def gui():
         def render(self, data):
             self.busy = False
             if data is not None:
-                self.services, self.has_tasks, self.sdver = data["services"], bool(data["tasks"]), data["systemd"]
+                self.has_tasks, self.sdver = bool(data["tasks"]), data["systemd"]
                 if data["linger"] != self.linger: self.linger = data["linger"]; self.update_menu()
                 tasks, free = data["tasks"], data["free"]
                 self.cur = {m["timer"]: m for m in tasks}
