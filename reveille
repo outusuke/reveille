@@ -21,7 +21,7 @@ INSTALLED = f"{APPS}/reveille/reveille"          # stable copy, so moving the do
 DESKTOP = f"{APPS}/applications/io.github.reveille.desktop"
 PREFIX = "reveille-"            # only units with this prefix are ever touched
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-TRIGGERS = ["Daily", "Weekly", "Monthly", "Every N minutes/hours", "At login", "Custom calendar expression"]
+TRIGGERS = ["Daily", "Weekly", "Monthly", "Every N min/hours", "At login", "Custom"]
 TRIGGER_IDS = ["daily", "weekly", "monthly", "interval", "login", "custom"]
 DEFAULT_TR = {"type": "daily", "hour": 3, "minute": 0, "days": ["Mon"], "dom": 1, "every": 30, "unit": "min", "expr": ""}
 
@@ -409,7 +409,7 @@ def gui():
             self.name = Adw.EntryRow(title="Name", text=t.get("name", "")); g.add(self.name)
 
             g = Adw.PreferencesGroup(title="What to run"); page.add(g)
-            self.kind = Adw.ComboRow(title="Run", model=Gtk.StringList.new(["An application", "A command", "An existing systemd service"]),
+            self.kind = Adw.ComboRow(title="Run", model=Gtk.StringList.new(["Application", "Command", "Service"]),
                                      selected=["app", "command", "service"].index(t["kind"]))
             g.add(self.kind)
             self.app = Adw.ComboRow(title="Application", enable_search=True,
@@ -423,7 +423,11 @@ def gui():
                                     enable_search=True, model=Gtk.StringList.new(self.services))
             self.svc.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
             if t.get("service") in self.services: self.svc.set_selected(self.services.index(t["service"]))
-            g.add(self.svc)
+            for row in (self.app, self.svc):
+                def tip(r, *_):
+                    it = r.get_selected_item()
+                    r.set_tooltip_text(it.get_string() if it else None)
+                row.connect("notify::selected", tip); tip(row)
             self.cmd = Adw.EntryRow(title="Command (use sh -c \"…\" for pipes)", text=t.get("command", ""))
             g.add(self.cmd)
 
