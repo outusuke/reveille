@@ -90,14 +90,6 @@ class RoundTrip(Base):
             rv.apply_task(task(command="definitely-not-a-real-binary-xyz"))
         self.assertFalse(os.path.exists(rv.UNITS) and os.listdir(rv.UNITS))
 
-    def test_delete_and_undo(self):
-        rv.apply_task(task(command="true"))
-        m = rv.load_task("backup.timer")
-        snap = rv.remove_task(m)
-        self.assertEqual(os.listdir(rv.UNITS), [])
-        rv.restore_units(snap)
-        self.assertEqual(sorted(os.listdir(rv.UNITS)), ["backup.service", "backup.timer"])
-
 
 GPODDER_TIMER = """[Unit]
 Description=Run gpodder-update.service every 2 hours
@@ -280,6 +272,83 @@ class Schedules(unittest.TestCase):
             for l in lines: k, v = l.split("=", 1); kv.setdefault(k, []).append(v)
             back, catchup, delay = rv.parse_schedule(kv)
             self.assertEqual(back["type"], tr["type"]); self.assertEqual(delay, 30)
+
+
+class Delete(Base):
+    def delete(self, name):
+        return rv.remove_units(rv.delete_plan(name))
+
+    def test_timer_takes_its_own_service_along(self):
+        rv.apply_task(task(command="true"))
+        self.assertEqual(rv.delete_plan("backup.timer"), ["backup.timer", "backup.service"])
+        snap = self.delete("backup.timer")
+        self.assertEqual(os.listdir(rv.UNITS), [])
+        self.assertIn(("disable", "--now", "backup.timer"), CALLS)
+        rv.restore_units(snap)
+        self.assertEqual(sorted(os.listdir(rv.UNITS)), ["backup.service", "backup.timer"])
+
+    def test_locked_timer_can_be_deleted_too(self):
+        write("x.service", SIMPLE_SERVICE + "ExecStart=/usr/bin/false\n"); write("x.timer", SIMPLE_TIMER)
+        self.assertFalse(rv.load_task("x.timer")["full"])
+        self.assertEqual(rv.delete_plan("x.timer"), ["x.timer", "x.service"])
+
+    def test_shared_service_is_kept(self):
+        write("a.service", SIMPLE_SERVICE); write("a.timer", SIMPLE_TIMER)
+        write("b.timer", SIMPLE_TIMER.replace("[Timer]\n", "[Timer]\nUnit=a.service\n"))
+        self.assertEqual(rv.delete_plan("a.timer"), ["a.timer"])        # b.timer still triggers a.service
+        self.assertEqual(rv.delete_plan("b.timer"), ["b.timer"])        # a.service isn't b's own
+        self.delete("b.timer")
+        self.assertEqual(rv.delete_plan("a.timer"), ["a.timer", "a.service"])
+
+    def test_timer_for_a_system_service_only_removes_the_timer(self):
+        write("x.timer", SIMPLE_TIMER.replace("[Timer]\n", "[Timer]\nUnit=other.service\n"))
+        self.assertEqual(rv.delete_plan("x.timer"), ["x.timer"])
+
+    def test_unscheduled_service_is_deleted_alone(self):
+        write("s.service", SIMPLE_SERVICE); write("t.timer", SIMPLE_TIMER)
+        self.assertEqual(rv.delete_plan("s.service"), ["s.service"])
+        self.delete("s.service")
+        self.assertEqual(os.listdir(rv.UNITS), ["t.timer"])
+
+    def test_symlink_is_removed_as_a_link_and_restored_as_one(self):
+        real = os.path.join(TMP, "dotfiles"); os.makedirs(real, exist_ok=True)
+        with open(f"{real}/s.service", "w") as f: f.write(SIMPLE_SERVICE)
+        os.makedirs(rv.UNITS, exist_ok=True); os.symlink(f"{real}/s.service", f"{rv.UNITS}/s.service")
+        snap = self.delete("s.service")
+        self.assertFalse(os.path.lexists(f"{rv.UNITS}/s.service"))
+        self.assertTrue(os.path.exists(f"{real}/s.service"))              # the target is untouched
+        rv.restore_units(snap)
+        self.assertTrue(os.path.islink(f"{rv.UNITS}/s.service"))
+        self.assertEqual(os.readlink(f"{rv.UNITS}/s.service"), f"{real}/s.service")
+
+    def test_undo_re_enables_only_timers_that_were_active(self):
+        real = rv.unit_status
+        try:
+            for active in (True, False):
+                rv.apply_task(task(command="true"))
+                rv.unit_status = lambda unit, a=active: ("", a)
+                snap = self.delete("backup.timer")
+                CALLS.clear(); rv.restore_units(snap)
+                self.assertEqual(("enable", "--now", "backup.timer") in CALLS, active)
+                self.delete("backup.timer")
+        finally:
+            rv.unit_status = real
+
+    def test_backups_and_override_folders_are_never_touched(self):
+        write("x.service", SIMPLE_SERVICE); write("x.timer", SIMPLE_TIMER)
+        write("x.timer.reveille-bak", SIMPLE_TIMER); os.makedirs(f"{rv.UNITS}/x.service.d")
+        self.delete("x.timer")
+        self.assertEqual(sorted(os.listdir(rv.UNITS)), ["x.service.d", "x.timer.reveille-bak"])
+
+    def test_restore_does_not_overwrite_a_file_created_meanwhile(self):
+        write("x.timer", SIMPLE_TIMER)
+        snap = self.delete("x.timer")
+        write("x.timer", "[Timer]\nOnCalendar=hourly\n")
+        rv.restore_units(snap)
+        self.assertIn("hourly", rv.read_text(f"{rv.UNITS}/x.timer"))
+
+    def test_nothing_to_delete(self):
+        self.assertEqual(rv.delete_plan("missing.timer"), [])
 
 
 class Naming(Base):

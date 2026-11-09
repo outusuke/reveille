@@ -418,26 +418,48 @@ def apply_task(t):
     r = ctl("enable", "--now", unit) if t.get("enabled", True) else ctl("disable", "--now", unit)
     return r.stderr.strip() if r.returncode else None
 
-def remove_task(m):
-    """Delete a task's own unit files. Returns {path: text} so the removal can be undone."""
-    snap = {}
-    ctl("disable", "--now", m["timer"])
-    names = [m["timer"]] + ([m["unit"] + ".service"] if m["kind"] != "service" else [])
+def delete_plan(name):
+    """The unit files that deleting `name` (a timer or a service without a timer) removes, as names in the
+    user unit folder. A timer takes its same-named service along, unless another timer still triggers it."""
+    names = [name]
+    if name.endswith(".timer"):
+        svc = name[:-6] + ".service"
+        if timer_target(name) == svc and not any(timer_target(t) == svc for t in user_timers() if t != name):
+            names.append(svc)
+    def is_unit_file(n):
+        p = f"{UNITS}/{n}"
+        return os.path.islink(p) or os.path.isfile(p)
+    return [n for n in names if is_unit_file(n)]
+
+def remove_units(names):
+    """Stop timers and delete the files (a symlink is removed as a link). Returns a snapshot for restore_units."""
+    snap = {"items": [], "enable": []}
     for n in names:
         p = f"{UNITS}/{n}"
+        if n.endswith(".timer"):
+            if unit_status(n)[1]: snap["enable"].append(n)
+            ctl("disable", "--now", n)
         try:
-            with open(p) as f: snap[p] = f.read()
+            if os.path.islink(p):
+                snap["items"].append(("link", p, os.readlink(p)))
+            else:
+                with open(p, "rb") as f: snap["items"].append(("file", p, f.read()))
             os.unlink(p)
         except OSError: pass
     ctl("daemon-reload")
     return snap
 
 def restore_units(snap):
-    for p, text in snap.items():
-        with open(p, "w") as f: f.write(text)
+    os.makedirs(UNITS, exist_ok=True)
+    for kind, p, payload in snap["items"]:
+        try:
+            if os.path.lexists(p): continue            # something new took its place meanwhile: don't overwrite it
+            if kind == "link": os.symlink(payload, p)
+            else:
+                with open(p, "wb") as f: f.write(payload)
+        except OSError: pass
     ctl("daemon-reload")
-    for p in snap:
-        if p.endswith(".timer"): ctl("enable", "--now", os.path.basename(p))
+    for n in snap["enable"]: ctl("enable", "--now", n)
 
 def set_timers(names, on):
     for n in names: ctl("enable" if on else "disable", "--now", n)
@@ -495,7 +517,7 @@ def gui():
 
     class Editor(Adw.Dialog):
         def __init__(self, win, m=None, preset=None):
-            super().__init__(title="Edit task" if m else "New task", content_width=520, content_height=680)
+            super().__init__(title="Edit task" if m else ("Schedule service" if preset else "New task"), content_width=520, content_height=680)
             self.win, self.m = win, m
             self.full = m is None or m["full"]            # a hand-written unit only has its schedule editable
             t = m or {"kind": "app", "enabled": True, "catchup": True,
@@ -583,9 +605,12 @@ def gui():
             self.own_only = [self.cwd, self.env, self.timeout, self.ac, self.online]   # don't apply to an existing service
             for r in self.own_only + [self.delay]: g.add(r)
 
-            if m and self.full:
+            # Delete lives inside the item: a task's timer, or a service without a timer opened via its row
+            self.target = m["timer"] if m else (preset if preset and delete_plan(preset) else None)
+            if self.target:
                 g = Adw.PreferencesGroup(); page.add(g)
-                db = Gtk.Button(label="Delete task", halign=Gtk.Align.CENTER); db.add_css_class("destructive-action")
+                db = Gtk.Button(label="Delete task" if m else "Delete service", halign=Gtk.Align.CENTER)
+                db.add_css_class("destructive-action")
                 db.connect("clicked", lambda *_: self.delete()); g.add(db)
 
             hb = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
@@ -665,9 +690,7 @@ def gui():
             self.win.toast(f"Saved, but systemd said: {err[:80]}" if err else "Task saved")
 
         def delete(self):
-            snap = remove_task(self.m)
-            self.close(); self.win.fill()
-            self.win.toast("Task deleted", "Undo", lambda: (restore_units(snap), self.win.fill()))
+            self.close(); self.win.ask_delete(self.target)
 
     class Win(Adw.ApplicationWindow):
         def __init__(self, app):
@@ -729,6 +752,23 @@ def gui():
             else:
                 Editor(self, m, preset).present(self)
 
+        def ask_delete(self, name):
+            names = delete_plan(name)
+            if not names:
+                return self.toast("Nothing to delete: that unit isn't in ~/.config/systemd/user")
+            lines = [f"• {n}" + (" (a link; the file it points to is kept)" if os.path.islink(f"{UNITS}/{n}") else "")
+                     for n in names]
+            d = Adw.AlertDialog(heading="Delete?", body="This will delete:\n" + "\n".join(lines))
+            d.add_response("cancel", "Cancel"); d.add_response("delete", "Delete")
+            d.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+            d.set_close_response("cancel"); d.set_default_response("cancel")
+            d.connect("response", lambda _d, r: r == "delete" and self.do_delete(names))
+            d.present(self)
+
+        def do_delete(self, names):
+            snap = remove_units(names); self.fill()
+            self.toast("Deleted", "Undo", lambda: (restore_units(snap), self.fill()))
+
         def task_row(self, m):
             last = last_run(m["service"])
             nxt, active = unit_status(m["timer"])
@@ -751,12 +791,12 @@ def gui():
             return row
 
         def free_row(self, svc):
-            row = Adw.ActionRow(title=GLib.markup_escape_text(svc), subtitle="No schedule")
+            row = Adw.ActionRow(title=GLib.markup_escape_text(svc), subtitle="No schedule · click to schedule or delete", activatable=True)
+            row.connect("activated", lambda _r: self.edit(None, svc))
             row.add_prefix(Gtk.Image(icon_name="emblem-system-symbolic"))
             row.add_suffix(icon_btn("media-playback-start-symbolic", "Run now",
                                     lambda: (ctl("start", "--no-block", svc), self.toast("Started"))))
-            b = Gtk.Button(label="Schedule…", valign=Gtk.Align.CENTER)
-            b.connect("clicked", lambda *_: self.edit(None, svc)); row.add_suffix(b)
+            row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))     # the whole row opens its editor
             return row
 
         def fill(self):
