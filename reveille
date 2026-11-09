@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+"""Task Scheduler: a small GTK4/libadwaita front end for systemd user timers.
+
+  reveille               open the window
+  reveille run-task ID   what every timer calls: run one task and record the result
+  reveille install       add it to the app menu (copies itself to ~/.local/share/reveille)
+  reveille uninstall     remove it from the app menu
+  reveille services      list what the service picker finds (for troubleshooting)
+"""
+import json, os, re, shlex, subprocess, sys, time, uuid
+
+HOME = os.path.expanduser("~")
+CONF = os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config")
+STATE = os.environ.get("XDG_STATE_HOME", f"{HOME}/.local/state")
+TASKS = f"{CONF}/reveille/tasks.json"
+RUNS = f"{STATE}/reveille/runs"
+UNITS = f"{CONF}/systemd/user"
+SELF = os.path.realpath(__file__)
+APPS = os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share")
+INSTALLED = f"{APPS}/reveille/reveille"          # stable copy, so moving the download never breaks the timers
+DESKTOP = f"{APPS}/applications/io.github.reveille.desktop"
+PREFIX = "reveille-"            # only units with this prefix are ever touched
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+TRIGGERS = ["Daily", "Weekly", "Monthly", "Every N minutes/hours", "At login", "Custom calendar expression"]
+TRIGGER_IDS = ["daily", "weekly", "monthly", "interval", "login", "custom"]
+DEFAULT_TR = {"type": "daily", "hour": 3, "minute": 0, "days": ["Mon"], "dom": 1, "every": 30, "unit": "min", "expr": ""}
+
+
+# ---------------------------------------------------------------- storage
+def load_tasks():
+    try:
+        with open(TASKS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+def save_tasks(tasks):
+    os.makedirs(os.path.dirname(TASKS), exist_ok=True)
+    tmp = TASKS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(tasks, f, indent=2)
+    os.replace(tmp, TASKS)
+
+def last_run(t):
+    if t.get("kind") == "service":
+        r = subprocess.run(["systemctl", "--user", "show", t["service"], "-p", "Result", "-p", "ExecMainStatus",
+                            "-p", "ExecMainExitTimestamp"], capture_output=True, text=True)
+        kv = dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+        if not kv.get("ExecMainExitTimestamp"): return None
+        rc = 0 if kv.get("Result") == "success" else (int(kv.get("ExecMainStatus") or 0) or 1)
+        return {"time": kv["ExecMainExitTimestamp"], "rc": rc}
+    try:
+        with open(f"{RUNS}/{t['id']}.json") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------- schedules
+def on_calendar(tr):
+    h, m = int(tr.get("hour", 0)), int(tr.get("minute", 0))
+    t = tr["type"]
+    if t == "daily":
+        return f"*-*-* {h:02d}:{m:02d}:00"
+    if t == "weekly":
+        days = ",".join(d for d in DAYS if d in tr.get("days", []))
+        return f"{days} *-*-* {h:02d}:{m:02d}:00"
+    if t == "monthly":
+        return f"*-*-{int(tr.get('dom', 1)):02d} {h:02d}:{m:02d}:00"
+    if t == "custom":
+        return tr.get("expr", "").strip() or None
+    return None
+
+def describe(tr):
+    t, hm = tr["type"], f"{int(tr.get('hour', 0)):02d}:{int(tr.get('minute', 0)):02d}"
+    if t == "daily": return f"Every day at {hm}"
+    if t == "weekly": return f"{', '.join(d for d in DAYS if d in tr.get('days', []))} at {hm}"
+    if t == "monthly": return f"Day {tr.get('dom', 1)} of every month at {hm}"
+    if t == "custom": return tr.get("expr", "custom schedule")
+    if t == "interval": return f"Every {tr.get('every', 1)} {'hours' if tr.get('unit') == 'h' else 'minutes'}"
+    return "At login"
+
+def calendar_parts(expr):
+    """A custom schedule may hold several calendar expressions separated by | (one OnCalendar= line each)."""
+    return [p.strip() for p in expr.split("|") if p.strip()]
+
+def next_elapse(tr):
+    """Text for the live preview in the editor."""
+    cal = on_calendar(tr)
+    if cal:
+        res = []
+        for part in calendar_parts(cal):
+            try:
+                out = subprocess.run(["systemd-analyze", "calendar", part], capture_output=True, text=True, timeout=5).stdout
+            except (OSError, subprocess.TimeoutExpired):
+                return "Preview unavailable"
+            nxt = re.search(r"Next elapse:\s*(.+)", out)
+            left = re.search(r"From now:\s*(.+)", out)
+            if not nxt: return "Not a valid schedule"
+            res.append(nxt.group(1).strip() + (f"  ({left.group(1).strip()})" if left else ""))
+        return "\n".join(res) if res else "Not a valid schedule"
+    if tr["type"] == "interval":
+        return f"First run {tr['every']} {'h' if tr['unit'] == 'h' else 'min'} after login, then repeats"
+    return "Shortly after you log in"
+
+
+# ---------------------------------------------------------------- systemd
+def ctl(*a, check=False):
+    return subprocess.run(["systemctl", "--user", *a], capture_output=True, text=True, check=check)
+
+def exe_path():
+    return INSTALLED if os.path.isfile(INSTALLED) else SELF
+
+def esc(s):                       # "%" is special in unit files
+    return s.replace("%", "%%")
+
+def timer_lines(tr, catchup, delay):
+    out, cal = [], on_calendar(tr)
+    if cal:
+        out += [f"OnCalendar={p}" for p in calendar_parts(cal)]
+        if catchup: out.append("Persistent=true")
+    elif tr["type"] == "interval":
+        step = f"{int(tr['every'])}{'h' if tr['unit'] == 'h' else 'min'}"
+        out += [f"OnStartupSec={step}", f"OnUnitActiveSec={step}"]
+    else:
+        out.append("OnStartupSec=10s")
+    if delay: out.append(f"RandomizedDelaySec={int(delay)}")
+    return out
+
+SCHEDULE_KEYS = ("OnCalendar", "OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnActiveSec", "OnUnitInactiveSec",
+                 "Persistent", "RandomizedDelaySec")
+
+def timer_path(unit):
+    return os.path.realpath(f"{CONF}/systemd/user/{unit}")
+
+def from_calendar(expr):
+    e, hm = expr.strip(), r"(\d\d?):(\d\d)(?::00)?"
+    if e == "daily": return {"type": "daily", "hour": 0, "minute": 0}
+    m = re.fullmatch(rf"\*-\*-\* {hm}", e)
+    if m: return {"type": "daily", "hour": int(m[1]), "minute": int(m[2])}
+    m = re.fullmatch(rf"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:,(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun))*) \*-\*-\* {hm}", e)
+    if m: return {"type": "weekly", "days": m[1].split(","), "hour": int(m[2]), "minute": int(m[3])}
+    m = re.fullmatch(rf"\*-\*-(\d\d?) {hm}", e)
+    if m and 1 <= int(m[1]) <= 28: return {"type": "monthly", "dom": int(m[1]), "hour": int(m[2]), "minute": int(m[3])}
+    return {"type": "custom", "expr": e}
+
+def parse_timer(unit):
+    """Read a hand-written timer as (trigger, catchup, delay), or None if it uses something the editor would lose."""
+    try:
+        with open(timer_path(unit)) as f: lines = f.read().splitlines()
+    except OSError:
+        return None
+    sect, kv = None, {}
+    for l in lines:
+        st = l.strip()
+        if st.startswith("["): sect = st; continue
+        if sect == "[Timer]" and "=" in st and st[0] not in "#;":
+            k, v = st.split("=", 1); kv.setdefault(k.strip(), []).append(v.strip())
+    if any(k in kv for k in ("OnActiveSec", "OnUnitInactiveSec")): return None
+    catchup = kv.get("Persistent", ["false"])[-1].lower() in ("true", "yes", "1", "on")
+    delay = 0
+    if "RandomizedDelaySec" in kv:
+        m = re.fullmatch(r"(\d+)(?:s|sec)?", kv["RandomizedDelaySec"][-1])
+        if not m: return None
+        delay = int(m[1])
+    cals, start = kv.get("OnCalendar", []), kv.get("OnStartupSec", []) + kv.get("OnBootSec", [])
+    active = kv.get("OnUnitActiveSec", [])
+    if len(cals) == 1 and not start and not active:
+        tr = from_calendar(cals[0])
+    elif len(cals) > 1 and not start and not active:
+        tr = {"type": "custom", "expr": " | ".join(cals)}
+    elif not cals and len(active) == 1 and len(start) <= 1:
+        m = re.fullmatch(r"(\d+)\s*(min|m|minutes?|h|hr|hours?)", active[0])
+        if not m or (start and start[0] != active[0]): return None
+        tr = {"type": "interval", "every": int(m[1]), "unit": "h" if m[2][0] == "h" else "min"}
+    elif not cals and not active and len(start) == 1 and re.fullmatch(r"\d+\s*s(ec)?", start[0]):
+        tr = {"type": "login"}
+    else:
+        return None
+    return {**DEFAULT_TR, **tr}, catchup, delay
+
+def rewrite_timer(unit, tr, catchup, delay):
+    """Replace only the schedule lines of a hand-written timer; everything else in the file is kept."""
+    path = timer_path(unit)
+    try:
+        with open(path) as f: lines = f.read().splitlines()
+        if not os.path.exists(path + ".reveille-bak"):          # one-time backup of the original
+            with open(path + ".reveille-bak", "w") as f: f.write("\n".join(lines) + "\n")
+        new, sect, done = [], None, False
+        for l in lines:
+            st = l.strip()
+            if st.startswith("["): sect = st
+            if sect == "[Timer]" and "=" in st and st.split("=", 1)[0].strip() in SCHEDULE_KEYS: continue
+            new.append(l)
+            if st == "[Timer]" and not done: new += timer_lines(tr, catchup, delay); done = True
+        if not done: new += ["", "[Timer]"] + timer_lines(tr, catchup, delay)
+        with open(path, "w") as f: f.write("\n".join(new) + "\n")
+    except OSError as e:
+        return e.strerror or str(e)
+    ctl("daemon-reload")
+    if unit_status(unit)[1]: ctl("restart", unit)
+    return None
+
+def unit_texts(t):
+    """(service text or None, timer text). A task that triggers an existing service has no service of its own."""
+    name, tid, tr, adv = t["name"].replace("\n", " "), t["id"], t["trigger"], t.get("adv", {})
+    service = None
+    if t["kind"] != "service":
+        unit = f"Description=reveille: {esc(name)}\nAfter=graphical-session.target\n"
+        if adv.get("ac"): unit += "ConditionACPower=true\n"
+        if adv.get("online"): unit += "Wants=network-online.target\nAfter=network-online.target\n"
+        svc = "Type=oneshot\n"
+        if adv.get("cwd"): svc += f"WorkingDirectory={esc(adv['cwd'])}\n"
+        for kv in shlex.split(adv.get("env", "")): svc += f"Environment={shlex.quote(esc(kv))}\n"
+        if adv.get("timeout"): svc += f"TimeoutStartSec={int(adv['timeout'])}min\n"
+        svc += f"ExecStart={shlex.quote(sys.executable)} {shlex.quote(esc(exe_path()))} run-task {tid}\n"
+        service = f"[Unit]\n{unit}\n[Service]\n{svc}"
+    timer = f"[Unit]\nDescription=reveille timer: {esc(name)}\n\n[Timer]\n"
+    if t["kind"] == "service": timer += f"Unit={t['service']}\n"
+    timer += "".join(l + "\n" for l in timer_lines(tr, t.get("catchup", True), adv.get("delay", 0)))
+    timer += "\n[Install]\nWantedBy=timers.target\n"
+    return service, timer
+
+def list_services():
+    """Names of the user's existing service units (not our own, not templates, not masked).
+    Merges what systemd reports with the unit folders, so one source missing a unit doesn't hide it."""
+    names = set()
+    def add(n):
+        if n.endswith(".service") and "@." not in n and not n.startswith(PREFIX): names.add(n)
+    for cmd in (("list-unit-files", "--type=service"), ("list-units", "--type=service", "--all")):
+        for l in ctl(*cmd, "--no-legend", "--no-pager").stdout.splitlines():
+            parts = l.replace("●", " ").replace("*", " ").split()
+            if parts: add(parts[0])
+    dirs = [f"{CONF}/systemd/user", f"{APPS}/systemd/user", "/etc/systemd/user", "/usr/local/lib/systemd/user",
+            "/usr/lib/systemd/user"]
+    dirs += [f"{d}/systemd/user" for d in os.environ.get("XDG_CONFIG_DIRS", "/etc/xdg").split(":") if d]
+    for d in dirs:
+        try: entries = os.listdir(d)
+        except OSError: continue
+        for n in entries:
+            p = f"{d}/{n}"
+            if os.path.isdir(p) and not os.path.islink(p): continue
+            if os.path.realpath(p) == "/dev/null": continue      # masked
+            add(n)
+    return sorted(names)
+
+def apply_task(t):
+    """Write the units for a task and (de)activate its timer."""
+    os.makedirs(UNITS, exist_ok=True)
+    service, timer = unit_texts(t)
+    base = f"{UNITS}/{PREFIX}{t['id']}"
+    for ext, text in ((".service", service), (".timer", timer)):
+        if text is None:                       # e.g. the task was switched to an existing service
+            try: os.unlink(base + ext)
+            except OSError: pass
+            continue
+        with open(base + ext, "w") as f:
+            f.write(text)
+    ctl("daemon-reload")
+    unit = f"{PREFIX}{t['id']}.timer"
+    r = ctl("enable", "--now", unit) if t.get("enabled", True) else ctl("disable", "--now", unit)
+    return r.stderr.strip() if r.returncode else None
+
+def remove_task_units(tid):
+    unit = f"{PREFIX}{tid}.timer"
+    ctl("disable", "--now", unit)
+    for ext in (".service", ".timer"):
+        try: os.unlink(f"{UNITS}/{PREFIX}{tid}{ext}")
+        except OSError: pass
+    ctl("daemon-reload")
+
+def unit_status(unit):
+    """(next run text or "", is_active) for a timer unit"""
+    r = ctl("show", unit, "-p", "ActiveState", "-p", "NextElapseUSecRealtime")
+    kv = dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+    return kv.get("NextElapseUSecRealtime", "").strip(), kv.get("ActiveState") == "active"
+
+def timer_status(tid):
+    return unit_status(f"{PREFIX}{tid}.timer")
+
+def external_units():
+    """Services (and the timers that trigger them) in ~/.config/systemd/user that reveille did not create.
+    Returns [(service name, [timer names])]."""
+    d = f"{CONF}/systemd/user"
+    try: files = os.listdir(d)
+    except OSError: return []
+    timers = {}
+    for n in files:
+        if n.endswith(".timer") and not n.startswith(PREFIX):
+            target = n[:-6] + ".service"
+            try:
+                with open(f"{d}/{n}") as f:
+                    for l in f:
+                        if l.strip().startswith("Unit="): target = l.split("=", 1)[1].strip()
+            except OSError: pass
+            timers.setdefault(target, []).append(n)
+    out = []
+    for n in sorted(files):
+        p = f"{d}/{n}"
+        if (n.endswith(".service") and "@." not in n and not n.startswith(PREFIX)
+                and not os.path.isdir(p) and os.path.realpath(p) != "/dev/null"):
+            out.append((n, timers.get(n, [])))
+    out += [(tgt, tl) for tgt, tl in timers.items() if tgt not in files]
+    return out
+
+def set_timers(names, on):
+    for n in names: ctl("enable" if on else "disable", "--now", n)
+
+def start_now(t):
+    ctl("start", "--no-block", t["service"] if t["kind"] == "service" else f"{PREFIX}{t['id']}.service")
+
+
+# ---------------------------------------------------------------- app menu
+def menu_installed():
+    return os.path.isfile(DESKTOP)
+
+def refresh_desktop_db():
+    try: subprocess.run(["update-desktop-database", os.path.dirname(DESKTOP)], capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired): pass
+
+def reapply_all():
+    """Rewrite every task's units so they point at the current program path."""
+    for t in load_tasks(): apply_task(t)
+
+def install_menu():
+    """Copy the program to a stable place and add an entry to the app menu. Returns an error text or None."""
+    try:
+        os.makedirs(os.path.dirname(INSTALLED), exist_ok=True)
+        if os.path.realpath(SELF) != os.path.realpath(INSTALLED):
+            import shutil
+            shutil.copyfile(SELF, INSTALLED + ".tmp"); os.chmod(INSTALLED + ".tmp", 0o755)
+            os.replace(INSTALLED + ".tmp", INSTALLED)
+        os.makedirs(os.path.dirname(DESKTOP), exist_ok=True)
+        cmd = f'"{sys.executable}" "{INSTALLED}"'
+        with open(DESKTOP, "w") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=Task Scheduler\n"
+                    "Comment=Run apps and commands on a schedule\n"
+                    f"Exec={cmd}\nIcon=preferences-system-time\nTerminal=false\n"
+                    "Categories=Utility;System;\nKeywords=schedule;timer;cron;task;\n")
+    except OSError as e:
+        return e.strerror or str(e)
+    refresh_desktop_db(); reapply_all()
+    return None
+
+def uninstall_menu():
+    for p in (DESKTOP,):
+        try: os.unlink(p)
+        except OSError: pass
+    try: os.unlink(INSTALLED)
+    except OSError: pass
+    refresh_desktop_db()
+    if os.path.realpath(SELF) != os.path.realpath(INSTALLED): reapply_all()    # timers go back to the original path
+
+
+# ---------------------------------------------------------------- run-task
+def run_task(tid):
+    task = next((t for t in load_tasks() if t["id"] == tid), None)
+    if not task:
+        print(f"reveille: unknown task {tid}", file=sys.stderr); return 1
+    rc = 0
+    try:
+        if task["kind"] == "app":
+            from gi.repository import Gio
+            info = Gio.DesktopAppInfo.new(task["app"])
+            if info is None: raise RuntimeError(f"app {task['app']} is not installed")
+            info.launch([], None)
+        else:
+            rc = subprocess.run(shlex.split(task["command"])).returncode
+    except Exception as e:
+        print(f"reveille: {e}", file=sys.stderr); rc = 1
+    os.makedirs(RUNS, exist_ok=True)
+    with open(f"{RUNS}/{tid}.json", "w") as f:
+        json.dump({"time": time.strftime("%a %d %b %H:%M"), "rc": rc}, f)
+    return rc
+
+
+# ---------------------------------------------------------------- GUI
+def gui():
+    import gi
+    gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gio, GLib, Gtk
+
+    def icon_btn(icon, tip, cb, css=None):
+        b = Gtk.Button(icon_name=icon, tooltip_text=tip, valign=Gtk.Align.CENTER)
+        b.add_css_class("flat")
+        if css: b.add_css_class(css)
+        b.connect("clicked", lambda *_: cb())
+        return b
+
+    class Editor(Adw.Dialog):
+        def __init__(self, win, task, preset=None, ext=None):
+            super().__init__(title="Edit task" if task else "New task", content_width=520, content_height=680)
+            self.win, self.task = win, task
+            t = task or {"kind": "app", "enabled": True, "catchup": True,
+                         "trigger": {"type": "daily", "hour": 3, "minute": 0, "days": ["Mon"], "dom": 1,
+                                     "every": 30, "unit": "min"}}
+            self.ext = ext
+            if ext:                                       # editing the schedule of a hand-written timer
+                trg, catchup, delay = parse_timer(ext)
+                t = {"kind": "service", "name": ext, "enabled": True, "catchup": catchup, "trigger": trg,
+                     "adv": {"delay": delay}}
+            if preset: t = dict(t, kind="service", service=preset, name=preset[:-8] if preset.endswith(".service") else preset)
+            tr = {**DEFAULT_TR, **t["trigger"]}
+            self.apps = sorted((a for a in Gio.AppInfo.get_all() if a.should_show()),
+                               key=lambda a: a.get_name().lower())
+
+            page = Adw.PreferencesPage()
+            g = Adw.PreferencesGroup(title="General"); page.add(g)
+            self.name = Adw.EntryRow(title="Name", text=t.get("name", "")); g.add(self.name)
+
+            g = Adw.PreferencesGroup(title="What to run"); page.add(g)
+            self.kind = Adw.ComboRow(title="Run", model=Gtk.StringList.new(["An application", "A command", "An existing systemd service"]),
+                                     selected=["app", "command", "service"].index(t["kind"]))
+            g.add(self.kind)
+            self.app = Adw.ComboRow(title="Application", enable_search=True,
+                                    model=Gtk.StringList.new([a.get_name() for a in self.apps]))
+            self.app.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
+            for i, a in enumerate(self.apps):
+                if a.get_id() == t.get("app"): self.app.set_selected(i)
+            g.add(self.app)
+            self.services = list_services()
+            self.svc = Adw.ComboRow(title="Service", subtitle=f"{len(self.services)} user services found",
+                                    enable_search=True, model=Gtk.StringList.new(self.services))
+            self.svc.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
+            if t.get("service") in self.services: self.svc.set_selected(self.services.index(t["service"]))
+            g.add(self.svc)
+            self.cmd = Adw.EntryRow(title="Command (use sh -c \"…\" for pipes)", text=t.get("command", ""))
+            g.add(self.cmd)
+
+            g = Adw.PreferencesGroup(title="When"); page.add(g)
+            self.trig = Adw.ComboRow(title="Repeat", model=Gtk.StringList.new(TRIGGERS),
+                                     selected=TRIGGER_IDS.index(tr["type"]))
+            g.add(self.trig)
+            self.hour = Adw.SpinRow.new_with_range(0, 23, 1); self.hour.set_title("Hour"); self.hour.set_value(tr["hour"])
+            self.minute = Adw.SpinRow.new_with_range(0, 59, 1); self.minute.set_title("Minute"); self.minute.set_value(tr["minute"])
+            self.dom = Adw.SpinRow.new_with_range(1, 28, 1); self.dom.set_title("Day of month"); self.dom.set_value(tr["dom"])
+            self.every = Adw.SpinRow.new_with_range(1, 999, 1); self.every.set_title("Every"); self.every.set_value(tr["every"])
+            self.unit = Adw.ComboRow(title="Unit", model=Gtk.StringList.new(["minutes", "hours"]),
+                                     selected=1 if tr["unit"] == "h" else 0)
+            self.days_row = Adw.ActionRow(title="Days")
+            box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER); self.day_btns = {}
+            for d in DAYS:
+                b = Gtk.ToggleButton(label=d[:2], active=d in tr["days"]); b.connect("toggled", self.refresh)
+                self.day_btns[d] = b; box.append(b)
+            self.days_row.add_suffix(box)
+            self.expr = Adw.EntryRow(title="Calendar expression (e.g. Mon..Fri 09:00; separate several with |)", text=tr["expr"])
+            self.expr.connect("changed", self.refresh)
+            self.when = [self.hour, self.minute, self.days_row, self.dom, self.every, self.unit, self.expr]
+            for r in self.when: g.add(r)
+            self.preview = Adw.ActionRow(title="Next run", subtitle_selectable=True)
+            self.preview.add_css_class("property"); g.add(self.preview)
+
+            g = Adw.PreferencesGroup(title="Options"); page.add(g)
+            self.catchup = Adw.SwitchRow(title="Run missed tasks after startup",
+                                         subtitle="If the computer was off at the scheduled time",
+                                         active=t.get("catchup", True))
+            g.add(self.catchup)
+            self.enabled = Adw.SwitchRow(title="Enabled", active=t.get("enabled", True)); g.add(self.enabled)
+
+            adv = t.get("adv", {})
+            g = Adw.PreferencesGroup(title="Advanced"); page.add(g)
+            self.cwd = Adw.EntryRow(title="Working directory", text=adv.get("cwd", ""))
+            self.env = Adw.EntryRow(title="Environment (KEY=value KEY2=\"a b\")", text=adv.get("env", ""))
+            self.timeout = Adw.SpinRow.new_with_range(0, 1440, 1)
+            self.timeout.set_title("Stop after (minutes)"); self.timeout.set_subtitle("0 means never"); self.timeout.set_value(adv.get("timeout", 0))
+            self.ac = Adw.SwitchRow(title="Only on AC power", active=adv.get("ac", False))
+            self.online = Adw.SwitchRow(title="Wait for the network", active=adv.get("online", False))
+            self.delay = Adw.SpinRow.new_with_range(0, 3600, 10)
+            self.delay.set_title("Random delay (seconds)"); self.delay.set_subtitle("Spreads runs out so many tasks don't start at once")
+            self.delay.set_value(adv.get("delay", 0))
+            self.own_only = [self.cwd, self.env, self.timeout, self.ac, self.online]   # don't apply to an existing service
+            for r in self.own_only + [self.delay]: g.add(r)
+
+            if task:
+                g = Adw.PreferencesGroup(); page.add(g)
+                db = Gtk.Button(label="Delete task", halign=Gtk.Align.CENTER); db.add_css_class("destructive-action")
+                db.connect("clicked", lambda *_: self.delete()); g.add(db)
+
+            hb = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
+            cancel = Gtk.Button(label="Cancel"); cancel.connect("clicked", lambda *_: self.close()); hb.pack_start(cancel)
+            save = Gtk.Button(label="Save"); save.add_css_class("suggested-action")
+            save.connect("clicked", lambda *_: self.save()); hb.pack_end(save)
+            tv = Adw.ToolbarView(content=page); tv.add_top_bar(hb)
+            self.set_child(tv)
+
+            for w in (self.kind, self.trig, self.unit, self.svc):
+                w.connect("notify::selected", self.refresh)
+            for w in (self.hour, self.minute, self.dom, self.every):
+                w.connect("notify::value", self.refresh)
+            self.refresh()
+
+        def trigger(self):
+            tp = TRIGGER_IDS[self.trig.get_selected()]
+            return {"type": tp, "expr": self.expr.get_text().strip(), "hour": int(self.hour.get_value()), "minute": int(self.minute.get_value()),
+                    "days": [d for d, b in self.day_btns.items() if b.get_active()],
+                    "dom": int(self.dom.get_value()), "every": int(self.every.get_value()),
+                    "unit": "h" if self.unit.get_selected() == 1 else "min"}
+
+        def refresh(self, *_):
+            k = self.kind.get_selected()
+            self.app.set_visible(k == 0); self.cmd.set_visible(k == 1); self.svc.set_visible(k == 2)
+            for r in self.own_only: r.set_visible(k != 2)
+            if self.ext:                                   # only the schedule of an existing timer is editable
+                for r in (self.name, self.kind, self.app, self.cmd, self.svc, self.enabled, *self.own_only):
+                    r.set_visible(False)
+            tp = self.trig.get_selected()
+            show = {self.hour: tp in (0, 1, 2), self.minute: tp in (0, 1, 2), self.days_row: tp == 1,
+                    self.dom: tp == 2, self.every: tp == 3, self.unit: tp == 3, self.expr: tp == 5}
+            for w, v in show.items(): w.set_visible(v)
+            tr = self.trigger()
+            self.preview.set_subtitle("Pick at least one day" if tp == 1 and not tr["days"] else next_elapse(tr))
+
+        def save(self):
+            name, tr = self.name.get_text().strip(), self.trigger()
+            if tr["type"] == "custom" and (not calendar_parts(tr["expr"]) or any(
+                    subprocess.run(["systemd-analyze", "calendar", p], capture_output=True).returncode
+                    for p in calendar_parts(tr["expr"]))):
+                return self.win.toast("That is not a valid calendar expression")
+            if tr["type"] == "weekly" and not tr["days"]: return self.win.toast("Pick at least one day")
+            if self.ext:
+                err = rewrite_timer(self.ext, tr, self.catchup.get_active(), int(self.delay.get_value()))
+                self.close(); self.win.fill()
+                return self.win.toast(f"Could not save: {err}" if err else "Schedule updated")
+            k = self.kind.get_selected()
+            if not name: return self.win.toast("Give the task a name")
+            if tr["type"] == "weekly" and not tr["days"]: return self.win.toast("Pick at least one day")
+            t = dict(self.task or {"id": uuid.uuid4().hex[:8]})
+            t.update(name=name, kind=["app", "command", "service"][k], trigger=tr,
+                     catchup=self.catchup.get_active(), enabled=self.enabled.get_active())
+            try:
+                shlex.split(self.env.get_text())
+            except ValueError:
+                return self.win.toast("The environment field has an unclosed quote")
+            t["adv"] = {"cwd": self.cwd.get_text().strip(), "env": self.env.get_text().strip(),
+                        "timeout": int(self.timeout.get_value()), "ac": self.ac.get_active(),
+                        "online": self.online.get_active(), "delay": int(self.delay.get_value())}
+            if k == 0:
+                if not self.apps: return self.win.toast("No applications found")
+                t["app"] = self.apps[self.app.get_selected()].get_id()
+            elif k == 2:
+                if not self.services: return self.win.toast("No user services found")
+                t["service"] = self.services[self.svc.get_selected()]
+            else:
+                t["command"] = self.cmd.get_text().strip()
+                try:
+                    if not shlex.split(t["command"]): raise ValueError
+                except ValueError:
+                    return self.win.toast("Enter a valid command")
+            tasks = load_tasks()
+            tasks = [x for x in tasks if x["id"] != t["id"]] + [t]
+            save_tasks(tasks)
+            err = apply_task(t)
+            self.close(); self.win.fill()
+            self.win.toast(f"Saved, but systemd said: {err[:80]}" if err else "Task saved")
+
+        def delete(self):
+            tid, snapshot = self.task["id"], self.task
+            remove_task_units(tid)
+            save_tasks([x for x in load_tasks() if x["id"] != tid])
+            self.close(); self.win.fill()
+            self.win.toast("Task deleted", "Undo", lambda: self.win.restore(snapshot))
+
+    class Win(Adw.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Task Scheduler", default_width=640, default_height=560)
+            self.overlay = Adw.ToastOverlay()
+            tv = Adw.ToolbarView(); hb = Adw.HeaderBar()
+            add = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="New task")
+            add.connect("clicked", lambda *_: self.edit(None)); hb.pack_start(add)
+            self.menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", tooltip_text="Main menu")
+            hb.pack_end(self.menu_btn)
+            for name, fn in (("install-menu", self.do_install), ("remove-menu", self.do_remove)):
+                a = Gio.SimpleAction.new(name, None); a.connect("activate", lambda *_a, fn=fn: fn()); self.add_action(a)
+            self.update_menu()
+            tv.add_top_bar(hb)
+            self.stack = Gtk.Stack()
+            empty = Adw.StatusPage(icon_name="alarm-symbolic", title="No tasks yet",
+                                   description="Schedule an app or a command to run automatically.")
+            first = Gtk.Button(label="Create task", halign=Gtk.Align.CENTER)
+            first.add_css_class("suggested-action"); first.add_css_class("pill")
+            first.connect("clicked", lambda *_: self.edit(None)); empty.set_child(first)
+            self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE); self.list.add_css_class("boxed-list")
+            self.ext_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE); self.ext_list.add_css_class("boxed-list")
+            self.h1 = Gtk.Label(label="Your tasks", xalign=0); self.h1.add_css_class("heading")
+            self.h2 = Gtk.Label(label="Other services in ~/.config/systemd/user", xalign=0); self.h2.add_css_class("heading")
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            for w in (self.h1, self.list, self.h2, self.ext_list): body.append(w)
+            clamp = Adw.Clamp(maximum_size=640, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12,
+                              child=body)
+            self.stack.add_named(empty, "empty"); self.stack.add_named(Gtk.ScrolledWindow(child=clamp), "list")
+            tv.set_content(self.stack); self.overlay.set_child(tv); self.set_content(self.overlay)
+            self.fill()
+            GLib.timeout_add_seconds(30, lambda: (self.fill(), True)[1])
+
+        def update_menu(self):
+            m = Gio.Menu()
+            if menu_installed(): m.append("Remove from app menu", "win.remove-menu")
+            else: m.append("Add to app menu", "win.install-menu")
+            self.menu_btn.set_menu_model(m)
+
+        def do_install(self):
+            err = install_menu()
+            self.update_menu(); self.fill()
+            self.toast(f"Could not add it: {err}" if err else "Added to the app menu")
+
+        def do_remove(self):
+            uninstall_menu(); self.update_menu(); self.fill()
+            self.toast("Removed from the app menu")
+
+        def toast(self, msg, button=None, cb=None):
+            t = Adw.Toast(title=msg, timeout=5)
+            if button:
+                t.set_button_label(button); t.connect("button-clicked", lambda *_: cb())
+            self.overlay.add_toast(t)
+
+        def edit(self, task, preset=None, ext=None):
+            Editor(self, task, preset, ext).present(self)
+
+        def edit_external(self, unit):
+            if parse_timer(unit) is None:
+                self.toast("This timer uses options the editor can't show, opening its file")
+                Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(timer_path(unit)), None)
+            else:
+                self.edit(None, None, unit)
+
+        def restore(self, task):
+            save_tasks(load_tasks() + [task]); apply_task(task); self.fill()
+
+        def toggle(self, task, on):
+            task["enabled"] = on
+            save_tasks([task if x["id"] == task["id"] else x for x in load_tasks()])
+            apply_task(task); self.fill()
+
+        def fill(self):
+            while (r := self.list.get_first_child()) is not None: self.list.remove(r)
+            tasks = sorted(load_tasks(), key=lambda t: t["name"].lower())
+            ext = external_units()
+            while (r := self.ext_list.get_first_child()) is not None: self.ext_list.remove(r)
+            self.stack.set_visible_child_name("list" if tasks or ext else "empty")
+            self.h1.set_visible(bool(tasks) and bool(ext)); self.list.set_visible(bool(tasks))
+            self.h2.set_visible(bool(ext)); self.ext_list.set_visible(bool(ext))
+            self.fill_external(ext)
+            for t in tasks:
+                nxt, active = timer_status(t["id"]); last = last_run(t)
+                parts = [describe(t["trigger"])]
+                if t.get("enabled", True) and active:
+                    parts.append(f"Next: {nxt}" if nxt else "Next: when triggered")
+                elif not t.get("enabled", True): parts.append("Disabled")
+                if last: parts.append(f"Last: {last['time']} " + ("OK" if last["rc"] == 0 else f"failed ({last['rc']})"))
+                row = Adw.ActionRow(title=GLib.markup_escape_text(t["name"]),
+                                    subtitle=GLib.markup_escape_text("\n".join(parts)), activatable=True)
+                bad = last and last["rc"] != 0
+                img = Gtk.Image(icon_name="dialog-warning-symbolic" if bad else "alarm-symbolic")
+                if bad: img.add_css_class("error")
+                row.add_prefix(img)
+                row.add_suffix(icon_btn("media-playback-start-symbolic", "Run now",
+                                        lambda t=t: (start_now(t), self.toast("Started"))))
+                sw = Gtk.Switch(active=t.get("enabled", True), valign=Gtk.Align.CENTER)
+                sw.connect("state-set", lambda _s, on, t=t: (self.toggle(t, on), False)[1])
+                row.add_suffix(sw)
+                row.connect("activated", lambda _r, t=t: self.edit(t))
+                self.list.append(row)
+
+    def _ext_row(win, svc, timers):
+        row = Adw.ActionRow(title=GLib.markup_escape_text(svc))
+        if timers:
+            nxt, active = unit_status(timers[0])
+            row.set_subtitle(GLib.markup_escape_text(
+                (f"Next: {nxt}" if nxt else "Timer active") if active else "Timer off")
+                + (f" · {len(timers)} timers" if len(timers) > 1 else ""))
+            sw = Gtk.Switch(active=active, valign=Gtk.Align.CENTER)
+            sw.connect("state-set", lambda _s, on: (set_timers(timers, on), GLib.idle_add(win.fill), False)[2])
+            row.add_prefix(Gtk.Image(icon_name="alarm-symbolic"))
+        else:
+            row.set_subtitle("No schedule")
+            row.add_prefix(Gtk.Image(icon_name="emblem-system-symbolic"))
+        row.add_suffix(icon_btn("media-playback-start-symbolic", "Run now",
+                                lambda: (ctl("start", "--no-block", svc), win.toast("Started"))))
+        if timers:
+            row.add_suffix(icon_btn("document-edit-symbolic", "Edit schedule" + (f" of {timers[0]}" if len(timers) > 1 else ""),
+                                    lambda: win.edit_external(timers[0])))
+            row.add_suffix(sw)
+        else:
+            b = Gtk.Button(label="Schedule…", valign=Gtk.Align.CENTER)
+            b.connect("clicked", lambda *_: win.edit(None, svc)); row.add_suffix(b)
+        return row
+
+    Win.fill_external = lambda self, ext: [self.ext_list.append(_ext_row(self, s_, t_)) for s_, t_ in ext]
+
+    class App(Adw.Application):
+        def __init__(self):
+            super().__init__(application_id="io.github.reveille")
+        def do_activate(self):
+            (self.props.active_window or Win(self)).present()
+
+    return App().run([])
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "run-task":
+        sys.exit(run_task(sys.argv[2]))
+    if len(sys.argv) == 2 and sys.argv[1] == "services":        # diagnostics: what the service picker sees
+        print(f"running: {SELF}\ninstalled copy: {INSTALLED} ({'exists' if os.path.isfile(INSTALLED) else 'none'})")
+        for d in (f"{CONF}/systemd/user", f"{APPS}/systemd/user"):
+            try: print(f"{d}: {sorted(os.listdir(d))}")
+            except OSError as e: print(f"{d}: {e.strerror}")
+        r = list_services(); print(f"\n{len(r)} services found:"); print("\n".join(r))
+        sys.exit(0)
+    if len(sys.argv) == 2 and sys.argv[1] in ("install", "uninstall"):
+        err = install_menu() if sys.argv[1] == "install" else uninstall_menu()
+        print(err or ("Added to the app menu" if sys.argv[1] == "install" else "Removed from the app menu"))
+        sys.exit(1 if err else 0)
+    sys.exit(gui())
