@@ -226,6 +226,24 @@ class Editable(Base):
         self.assertIn("[Install]\nWantedBy=timers.target", tim)
 
 
+class AppTasks(Base):
+    def test_app_task_keeps_the_app_alive_after_the_launcher_exits(self):
+        write("x.service", SIMPLE_SERVICE.replace("/usr/bin/true", "/usr/bin/gio launch /usr/share/applications/conky.desktop"))
+        write("x.timer", SIMPLE_TIMER)
+        m = rv.load_task("x.timer"); self.assertEqual((m["kind"], m["app"]), ("app", "conky.desktop"))
+        t = {k: m[k] for k in ("unit", "name", "kind", "trigger", "catchup", "enabled", "adv", "service")}
+        t.update(app=m["app"], old_name=m["name"], keep_exec=True)
+        svc, _ = rv.unit_texts(t, rv.read_text(f"{rv.UNITS}/x.service"), rv.read_text(f"{rv.UNITS}/x.timer"))
+        self.assertEqual(svc.count("KillMode=process"), 1)
+        self.assertIn("ExecStart=/usr/bin/gio launch /usr/share/applications/conky.desktop", svc)
+        again, _ = rv.unit_texts(t, svc, "")
+        self.assertEqual(again.count("KillMode=process"), 1)       # saving twice doesn't duplicate it
+
+    def test_command_task_has_no_kill_mode(self):
+        svc, _ = rv.unit_texts(task(command="true"))
+        self.assertNotIn("KillMode", svc)
+
+
 class MergeUnit(unittest.TestCase):
     def test_new_file_layout(self):
         out = rv.merge_unit("", {"Unit": ({"Description"}, ["Description=x"], lambda k, v: False),

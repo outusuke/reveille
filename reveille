@@ -383,6 +383,7 @@ def unit_texts(t, old_service="", old_timer=""):
         if adv.get("cwd"): svc.append(f"WorkingDirectory={esc(adv['cwd'])}")
         for kv in shlex.split(adv.get("env", "")): svc.append(f"Environment={shlex.quote(xesc(kv))}")
         if adv.get("timeout"): svc.append(f"TimeoutStartSec={int(adv['timeout'])}min")
+        if t["kind"] == "app": svc.append("KillMode=process")    # the launcher exits at once: don't kill the app it started
         if not keep_exec: svc.append(f"ExecStart={build_exec(t)}")
         def keep_unit(k, v):               # keep dependencies and conditions that aren't ours
             if k == "ConditionACPower": return v != "true"
@@ -390,7 +391,8 @@ def unit_texts(t, old_service="", old_timer=""):
             return False
         service = merge_unit(old_service, {
             "Unit": ({"ConditionACPower", "Wants", "After"} | ({"Description"} if desc else set()), unit, keep_unit),
-            "Service": ({"WorkingDirectory", "Environment", "TimeoutStartSec"} | (set() if keep_exec else {"ExecStart"}),
+            "Service": ({"WorkingDirectory", "Environment", "TimeoutStartSec"} | (set() if keep_exec else {"ExecStart"})
+                        | ({"KillMode"} if t["kind"] == "app" else set()),
                         svc, never)})
     timer = merge_unit(old_timer, {
         "Unit": ({"Description"} if desc else set(), [f"Description={esc(name)}"] if desc else [], never),
