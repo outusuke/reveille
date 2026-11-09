@@ -9,7 +9,7 @@ in ~/.config/systemd/user. Nothing else is kept on disk, and the timers never ca
   reveille uninstall    remove it from the app menu
   reveille services     list what the service picker finds (for troubleshooting)
 """
-import os, re, shlex, shutil, subprocess, sys
+import os, re, shlex, shutil, subprocess, sys, tempfile, threading
 
 HOME = os.path.expanduser("~")
 CONF = os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config")
@@ -25,7 +25,7 @@ DEFAULT_TR = {"type": "daily", "hour": 3, "minute": 0, "days": ["Mon"], "dom": 1
 
 SCHEDULE_KEYS = ("OnCalendar", "OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnActiveSec", "OnUnitInactiveSec",
                  "Persistent", "RandomizedDelaySec")
-ONLINE, GRAPHICAL = "network-online.target", "graphical-session.target"
+ONLINE = "network-online.target"
 
 
 # ---------------------------------------------------------------- unit files
@@ -105,6 +105,35 @@ def merge_unit(text, spec):
         if new and s not in seen: out += ([""] if out else []) + [f"[{s}]"] + new
     return "\n".join(out) + "\n"
 
+def write_atomic(path, text):
+    """Write a file so a crash or full disk never leaves a half-written unit. A symlink is followed: the file
+    it points to is replaced, the link stays."""
+    path = os.path.realpath(path)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".reveille-")
+    try:
+        with os.fdopen(fd, "w") as f: f.write(text)
+        try: os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+        except OSError: os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
+SPAN_UNITS = {"us": 1e-6, "usec": 1e-6, "ms": 1e-3, "msec": 1e-3, "": 1, "s": 1, "sec": 1, "second": 1, "seconds": 1,
+              "m": 60, "min": 60, "minute": 60, "minutes": 60, "h": 3600, "hr": 3600, "hour": 3600, "hours": 3600,
+              "d": 86400, "day": 86400, "days": 86400, "w": 604800, "week": 604800, "weeks": 604800}
+
+def parse_span(text):
+    """A systemd time span (\"90\", \"5min\", \"1h 30min\") as whole seconds, or None if it isn't one."""
+    text = text.strip()
+    if not re.fullmatch(r"(?:\d+\s*[a-z]*\s*)+", text): return None
+    total = 0
+    for n, u in re.findall(r"(\d+)\s*([a-z]*)", text):
+        if u not in SPAN_UNITS: return None
+        total += int(n) * SPAN_UNITS[u]
+    return int(total)
+
 def ctl(*a):
     return subprocess.run(["systemctl", "--user", *a], capture_output=True, text=True)
 
@@ -112,17 +141,29 @@ def props(unit, *names):
     r = ctl("show", unit, *[x for n in names for x in ("-p", n)])
     return dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
 
+def show_many(units, *names):
+    """One `systemctl show` for many units instead of one process each: {unit: {property: value}}."""
+    if not units: return {}
+    r = ctl("show", *units, *[x for n in ("Id",) + names for x in ("-p", n)])
+    out = {}
+    for block in r.stdout.split("\n\n"):
+        kv = dict(l.split("=", 1) for l in block.splitlines() if "=" in l)
+        if "Id" in kv: out[kv["Id"]] = kv
+    return out
+
 def unit_status(unit):
     """(next run text or "", is_active) for a timer unit"""
     kv = props(unit, "ActiveState", "NextElapseUSecRealtime")
     return kv.get("NextElapseUSecRealtime", "").strip(), kv.get("ActiveState") == "active"
 
-def last_run(service):
-    """Last result of a service, straight from systemd: {"time", "rc"} or None."""
-    kv = props(service, "Result", "ExecMainStatus", "ExecMainExitTimestamp")
+def last_run_from(kv):
     if not kv.get("ExecMainExitTimestamp"): return None
     rc = 0 if kv.get("Result") == "success" else (int(kv.get("ExecMainStatus") or 0) or 1)
     return {"time": kv["ExecMainExitTimestamp"], "rc": rc}
+
+def last_run(service):
+    """Last result of a service, straight from systemd: {"time", "rc"} or None."""
+    return last_run_from(props(service, "Result", "ExecMainStatus", "ExecMainExitTimestamp"))
 
 
 # ---------------------------------------------------------------- schedules
@@ -202,9 +243,8 @@ def parse_schedule(kv):
     catchup = kv.get("Persistent", ["false"])[-1].lower() in ("true", "yes", "1", "on")
     delay = 0
     if "RandomizedDelaySec" in kv:
-        m = re.fullmatch(r"(\d+)(?:s|sec)?", kv["RandomizedDelaySec"][-1])
-        if not m: return None
-        delay = int(m[1])
+        delay = parse_span(kv["RandomizedDelaySec"][-1])
+        if delay is None: return None
     cals, start = kv.get("OnCalendar", []), kv.get("OnStartupSec", []) + kv.get("OnBootSec", [])
     active = kv.get("OnUnitActiveSec", [])
     if len(cals) == 1 and not start and not active:
@@ -225,18 +265,11 @@ def rewrite_timer(unit, tr, catchup, delay):
     """Replace only the schedule lines of a hand-written timer; everything else in the file is kept."""
     path = unit_path(unit)
     try:
-        with open(path) as f: lines = f.read().splitlines()
+        with open(path) as f: text = f.read()
         if not os.path.exists(path + ".reveille-bak"):          # one-time backup of the original
-            with open(path + ".reveille-bak", "w") as f: f.write("\n".join(lines) + "\n")
-        new, sect, done = [], None, False
-        for l in lines:
-            st = l.strip()
-            if st.startswith("["): sect = st
-            if sect == "[Timer]" and "=" in st and st.split("=", 1)[0].strip() in SCHEDULE_KEYS: continue
-            new.append(l)
-            if st == "[Timer]" and not done: new += timer_lines(tr, catchup, delay); done = True
-        if not done: new += ["", "[Timer]"] + timer_lines(tr, catchup, delay)
-        with open(path, "w") as f: f.write("\n".join(new) + "\n")
+            write_atomic(path + ".reveille-bak", text)
+        write_atomic(path, merge_unit(text, {"Timer": (set(SCHEDULE_KEYS), timer_lines(tr, catchup, delay),
+                                                       lambda k, v: False)}))
     except OSError as e:
         return e.strerror or str(e)
     ctl("daemon-reload")
@@ -284,7 +317,7 @@ def parse_service(name):
         timeout = int(m[1])
     env = []
     for v in sv.get("Environment", []):
-        try: env += [xunesc(x) for x in shlex.split(v)]
+        try: env += [unesc(x) for x in shlex.split(v)]
         except ValueError: return {"why": "Environment= has an unclosed quote"}
     adv = {"cwd": unesc(sv.get("WorkingDirectory", [""])[-1]), "env": " ".join(shlex.quote(x) for x in env),
            "timeout": timeout, "ac": "true" in un.get("ConditionACPower", []), "online": ONLINE in deps}
@@ -295,7 +328,7 @@ def parse_service(name):
         s.update(kind="app", app=tokens[1] if tokens[1].endswith(".desktop") else tokens[1] + ".desktop")
     return s
 
-def load_task(timer):
+def load_task(timer, status=None):
     """Build a task from a timer file (and the service it starts). "full" means the editor can rewrite it."""
     u = read_unit(unit_path(timer))
     if u is None: return None
@@ -305,7 +338,9 @@ def load_task(timer):
     desc = unesc((u.get("Unit", {}).get("Description") or [""])[0])
     m = {"timer": timer, "unit": base, "service": target, "name": desc or base, "kind": "service", "full": False,
          "trigger": sched[0] if sched else None, "catchup": sched[1] if sched else True,
-         "adv": {"delay": sched[2] if sched else 0}, "enabled": unit_status(timer)[1]}
+         "adv": {"delay": sched[2] if sched else 0},
+         "enabled": (status[timer].get("ActiveState") == "active" if status is not None and timer in status
+                     else unit_status(timer)[1])}
     if not sched: return m
     if target == base + ".service" and os.path.isfile(f"{UNITS}/{target}"):
         s = parse_service(target)
@@ -381,13 +416,13 @@ def unit_texts(t, old_service="", old_timer=""):
         if adv.get("online"): unit += [f"Wants={ONLINE}", f"After={ONLINE}"]
         svc = [] if old_service else ["Type=oneshot"]
         if adv.get("cwd"): svc.append(f"WorkingDirectory={esc(adv['cwd'])}")
-        for kv in shlex.split(adv.get("env", "")): svc.append(f"Environment={shlex.quote(xesc(kv))}")
+        for kv in shlex.split(adv.get("env", "")): svc.append(f"Environment={shlex.quote(esc(kv))}")   # no $ expansion here
         if adv.get("timeout"): svc.append(f"TimeoutStartSec={int(adv['timeout'])}min")
         if t["kind"] == "app": svc.append("KillMode=process")    # the launcher exits at once: don't kill the app it started
         if not keep_exec: svc.append(f"ExecStart={build_exec(t)}")
         def keep_unit(k, v):               # keep dependencies and conditions that aren't ours
             if k == "ConditionACPower": return v != "true"
-            if k in ("Wants", "After"): return not set(v.split()) <= {ONLINE, GRAPHICAL}
+            if k in ("Wants", "After"): return set(v.split()) != {ONLINE}
             return False
         service = merge_unit(old_service, {
             "Unit": ({"ConditionACPower", "Wants", "After"} | ({"Description"} if desc else set()), unit, keep_unit),
@@ -406,15 +441,17 @@ def apply_task(t):
     """Write the units for a task and (de)activate its timer. Returns an error text or None."""
     base = f"{UNITS}/{t['unit']}"
     service, timer = unit_texts(t, read_text(base + ".service"), read_text(base + ".timer"))
-    os.makedirs(UNITS, exist_ok=True)
-    for ext, text in ((".service", service), (".timer", timer)):
-        if text is None:                       # the task was switched to an existing service: keep a backup
-            if os.path.exists(base + ext):
-                try: os.replace(base + ext, base + ext + ".reveille-bak")
-                except OSError: pass
-            continue
-        with open(base + ext, "w") as f:
-            f.write(text)
+    try:
+        os.makedirs(UNITS, exist_ok=True)
+        for ext, text in ((".service", service), (".timer", timer)):
+            if text is None:                   # the task was switched to an existing service: keep a backup
+                if os.path.exists(base + ext):
+                    try: os.replace(base + ext, base + ext + ".reveille-bak")
+                    except OSError: pass
+                continue
+            write_atomic(base + ext, text)
+    except OSError as e:
+        return f"Could not write the unit files: {e.strerror or e}"
     ctl("daemon-reload")
     unit = f"{t['unit']}.timer"
     r = ctl("enable", "--now", unit) if t.get("enabled", True) else ctl("disable", "--now", unit)
@@ -435,7 +472,7 @@ def delete_plan(name):
 
 def remove_units(names):
     """Stop timers and delete the files (a symlink is removed as a link). Returns a snapshot for restore_units."""
-    snap = {"items": [], "enable": []}
+    snap = {"items": [], "enable": [], "failed": []}
     for n in names:
         p = f"{UNITS}/{n}"
         if n.endswith(".timer"):
@@ -447,7 +484,8 @@ def remove_units(names):
             else:
                 with open(p, "rb") as f: snap["items"].append(("file", p, f.read()))
             os.unlink(p)
-        except OSError: pass
+        except OSError:
+            snap["items"] = [i for i in snap["items"] if i[1] != p]; snap["failed"].append(n)
     ctl("daemon-reload")
     return snap
 
@@ -468,6 +506,51 @@ def set_timers(names, on):
 
 def start_now(m):
     ctl("start", "--no-block", m["service"])
+
+
+def sh(*cmd, timeout=10):
+    """Run a program; None if it is missing or too slow."""
+    try: return subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired): return None
+
+def linger_state():
+    """Whether systemd keeps this user's session (and so its timers) running while logged out:
+    True, False, or None if it can't be told."""
+    r = sh("loginctl", "show-user", str(os.getuid()), "-p", "Linger")
+    m = re.search(r"^Linger=(\w+)", r.stdout, re.M) if r and r.returncode == 0 else None
+    return m[1] == "yes" if m else None
+
+def set_linger(on):
+    """Turn lingering on or off for the current user. Returns an error text or None."""
+    r = sh("loginctl", "enable-linger" if on else "disable-linger", timeout=30)
+    if r is None: return "loginctl is not available"
+    return (r.stderr.strip() or "loginctl failed") if r.returncode else None
+
+LOG_HINT = ("No log entries for this service yet.\n\nIf it has run before, your system may not keep a per-user "
+            "journal. Try: journalctl --user -u {unit}")
+
+def read_log(service, lines=200):
+    """The last lines of a service's journal: (text, None), or ("", error text)."""
+    r = sh("journalctl", "--user", f"--unit={service}", "-n", str(int(lines)), "--no-pager", "-o", "short-iso",
+           timeout=15)
+    if r is None: return "", "journalctl is not available or took too long"
+    if r.returncode: return "", r.stderr.strip() or "journalctl failed"
+    text = r.stdout.strip()
+    return (text, None) if text and not text.startswith("-- No entries") else (LOG_HINT.format(unit=service), None)
+
+def gather():
+    """Everything the window lists, fetched with two systemctl calls however many tasks there are.
+    No GTK in here, so it can run off the main thread."""
+    timers = user_timers()
+    st = show_many(timers, "ActiveState", "NextElapseUSecRealtime")
+    tasks = [m for m in (load_task(t, st) for t in timers) if m]
+    sv = show_many(sorted({m["service"] for m in tasks}), "Result", "ExecMainStatus", "ExecMainExitTimestamp")
+    for m in tasks:
+        m["next"] = st.get(m["timer"], {}).get("NextElapseUSecRealtime", "").strip()
+        m["last"] = last_run_from(sv.get(m["service"], {}))
+    tasks.sort(key=lambda m: m["name"].lower())
+    return {"tasks": tasks, "free": unscheduled_services(timers), "services": list_services(),
+            "linger": linger_state()}
 
 
 # ---------------------------------------------------------------- app menu
@@ -520,7 +603,7 @@ def gui():
     class Editor(Adw.Dialog):
         def __init__(self, win, m=None, preset=None):
             super().__init__(title="Edit task" if m else ("Schedule service" if preset else "New task"), content_width=520, content_height=680)
-            self.win, self.m = win, m
+            self.win, self.m, self._pv_src = win, m, 0
             self.full = m is None or m["full"]            # a hand-written unit only has its schedule editable
             t = m or {"kind": "app", "enabled": True, "catchup": True,
                       "trigger": {"type": "daily", "hour": 3, "minute": 0, "days": ["Mon"], "dom": 1,
@@ -550,7 +633,7 @@ def gui():
             for i, a in enumerate(self.apps):
                 if a.get_id() == t.get("app"): self.app.set_selected(i)
             g.add(self.app)
-            self.services = list_services()
+            self.services = win.services or list_services()
             self.svc = Adw.ComboRow(title="Service", subtitle=f"{len(self.services)} user services found",
                                     enable_search=True, model=Gtk.StringList.new(self.services))
             self.svc.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
@@ -601,7 +684,7 @@ def gui():
             self.timeout.set_title("Stop after (minutes)"); self.timeout.set_subtitle("0 means never"); self.timeout.set_value(adv.get("timeout", 0))
             self.ac = Adw.SwitchRow(title="Only on AC power", active=adv.get("ac", False))
             self.online = Adw.SwitchRow(title="Wait for the network", active=adv.get("online", False))
-            self.delay = Adw.SpinRow.new_with_range(0, 3600, 10)
+            self.delay = Adw.SpinRow.new_with_range(0, 86400, 10)
             self.delay.set_title("Random delay (seconds)"); self.delay.set_subtitle("Spreads runs out so many tasks don't start at once")
             self.delay.set_value(adv.get("delay", 0))
             self.own_only = [self.cwd, self.env, self.timeout, self.ac, self.online]   # don't apply to an existing service
@@ -647,7 +730,21 @@ def gui():
                     self.dom: tp == 2, self.every: tp == 3, self.unit: tp == 3, self.expr: tp == 5}
             for w, v in show.items(): w.set_visible(v)
             tr = self.trigger()
-            self.preview.set_subtitle("Pick at least one day" if tp == 1 and not tr["days"] else next_elapse(tr))
+            if tp == 1 and not tr["days"]:
+                self.preview.set_subtitle("Pick at least one day")
+            else:                                          # systemd-analyze runs off the main thread, after a pause
+                if self._pv_src: GLib.source_remove(self._pv_src)
+                self._pv_src = GLib.timeout_add(250, self.run_preview, tr)
+
+        def run_preview(self, tr):
+            self._pv_src = 0
+            def work(): GLib.idle_add(self.show_preview, tr, next_elapse(tr))
+            threading.Thread(target=work, daemon=True).start()
+            return False
+
+        def show_preview(self, tr, text):
+            if tr == self.trigger(): self.preview.set_subtitle(text)      # drop answers for an older input
+            return False
 
         def save(self):
             name, tr = self.name.get_text().strip(), self.trigger()
@@ -688,11 +785,74 @@ def gui():
                 err = apply_task(t)
             except ValueError as e:
                 return self.win.toast(str(e))
+            if err and err.startswith("Could not write"): return self.win.toast(err[:120])     # nothing was saved
             self.close(); self.win.fill()
             self.win.toast(f"Saved, but systemd said: {err[:80]}" if err else "Task saved")
 
         def delete(self):
             self.close(); self.win.ask_delete(self.target)
+
+    class RawView(Adw.Dialog):
+        """For a timer whose schedule the editor can't show: its file, plus the ways out (open it, delete it)."""
+        def __init__(self, win, m):
+            super().__init__(title=m["name"], content_width=560, content_height=560)
+            page = Adw.PreferencesPage()
+            page.add(Adw.PreferencesGroup(
+                title="Only the file can be edited",
+                description="This timer uses schedule options the editor can't show, so reveille leaves it alone. "
+                            "You can open the file in your editor, or delete the task."))
+            g = Adw.PreferencesGroup(title=GLib.markup_escape_text(m["timer"])); page.add(g)
+            tv = Gtk.TextView(editable=False, cursor_visible=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                              top_margin=8, bottom_margin=8, left_margin=8, right_margin=8)
+            tv.get_buffer().set_text(read_text(unit_path(m["timer"])))
+            sw = Gtk.ScrolledWindow(child=tv, min_content_height=220); sw.add_css_class("card"); g.add(sw)
+            g = Adw.PreferencesGroup(); page.add(g)
+            box = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+            ob = Gtk.Button(label="Open file")
+            ob.connect("clicked", lambda *_: Gio.AppInfo.launch_default_for_uri(
+                GLib.filename_to_uri(unit_path(m["timer"])), None))
+            db = Gtk.Button(label="Delete task"); db.add_css_class("destructive-action")
+            db.connect("clicked", lambda *_: (self.close(), win.ask_delete(m["timer"])))
+            box.append(ob); box.append(db); g.add(box)
+            hb = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
+            close = Gtk.Button(label="Close"); close.connect("clicked", lambda *_: self.close()); hb.pack_start(close)
+            tv_ = Adw.ToolbarView(content=page); tv_.add_top_bar(hb); self.set_child(tv_)
+
+    class LogView(Adw.Dialog):
+        """The tail of a service's journal, read in a thread so opening it never blocks the window."""
+        def __init__(self, service):
+            super().__init__(title=f"Log: {service}", content_width=720, content_height=560)
+            self.service = service
+            self.text = Gtk.TextView(editable=False, cursor_visible=False, monospace=True,
+                                     wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=8, bottom_margin=8,
+                                     left_margin=10, right_margin=10)
+            self.scroll = Gtk.ScrolledWindow(child=self.text, vexpand=True)
+            hb = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
+            close = Gtk.Button(label="Close"); close.connect("clicked", lambda *_: self.close()); hb.pack_start(close)
+            hb.pack_end(icon_btn("view-refresh-symbolic", "Reload", self.load))
+            hb.pack_end(icon_btn("edit-copy-symbolic", "Copy the log", self.copy))
+            tv = Adw.ToolbarView(content=self.scroll); tv.add_top_bar(hb); self.set_child(tv)
+            self.load()
+
+        def load(self):
+            self.text.get_buffer().set_text("Loading…")
+            def work():
+                text, err = read_log(self.service)
+                GLib.idle_add(self.show, err or text)
+            threading.Thread(target=work, daemon=True).start()
+
+        def show(self, text):
+            self.text.get_buffer().set_text(text)
+            GLib.timeout_add(100, self.to_end)             # after layout, so the newest lines are in view
+            return False
+
+        def to_end(self):
+            adj = self.scroll.get_vadjustment(); adj.set_value(adj.get_upper() - adj.get_page_size())
+            return False
+
+        def copy(self):
+            buf = self.text.get_buffer()
+            self.get_clipboard().set_text(buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False))
 
     class Win(Adw.ApplicationWindow):
         def __init__(self, app):
@@ -703,10 +863,14 @@ def gui():
             add.connect("clicked", lambda *_: self.edit(None)); hb.pack_start(add)
             self.menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", tooltip_text="Main menu")
             hb.pack_end(self.menu_btn)
-            for name, fn in (("install-menu", self.do_install), ("remove-menu", self.do_remove)):
+            self.linger, self.linger_dismissed = None, False
+            for name, fn in (("install-menu", self.do_install), ("remove-menu", self.do_remove),
+                             ("linger-on", lambda: self.do_linger(True)), ("linger-off", lambda: self.do_linger(False))):
                 a = Gio.SimpleAction.new(name, None); a.connect("activate", lambda *_a, fn=fn: fn()); self.add_action(a)
             self.update_menu()
             tv.add_top_bar(hb)
+            self.banner = Adw.Banner(title="Tasks only run while you're logged in", button_label="Learn more")
+            self.banner.connect("button-clicked", lambda *_: self.explain_linger()); tv.add_top_bar(self.banner)
             self.stack = Gtk.Stack()
             empty = Adw.StatusPage(icon_name="alarm-symbolic", title="No tasks yet",
                                    description="Schedule an app or a command to run automatically.")
@@ -721,8 +885,12 @@ def gui():
             for w in (self.h1, self.list, self.h2, self.free_list): body.append(w)
             clamp = Adw.Clamp(maximum_size=640, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12,
                               child=body)
+            self.stack.add_named(Gtk.Spinner(spinning=True, width_request=32, height_request=32,
+                                             halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER), "loading")
             self.stack.add_named(empty, "empty"); self.stack.add_named(Gtk.ScrolledWindow(child=clamp), "list")
             tv.set_content(self.stack); self.overlay.set_child(tv); self.set_content(self.overlay)
+            self.services, self.busy, self.again, self.sig, self.has_tasks = [], False, False, None, False
+            self.stack.set_visible_child_name("loading")
             self.fill()
             GLib.timeout_add_seconds(30, lambda: (self.fill(), True)[1])
 
@@ -730,7 +898,39 @@ def gui():
             m = Gio.Menu()
             if menu_installed(): m.append("Remove from app menu", "win.remove-menu")
             else: m.append("Add to app menu", "win.install-menu")
+            if self.linger is True: m.append("Don't run tasks while logged out", "win.linger-off")
+            elif self.linger is False: m.append("Run tasks while logged out", "win.linger-on")
             self.menu_btn.set_menu_model(m)
+
+        def explain_linger(self):
+            d = Adw.AlertDialog(
+                heading="Run tasks while you're logged out?",
+                body="Your tasks run inside your user session, so they wait when you are logged out, and after a "
+                     "restart until you log in. Turning on \"lingering\" keeps your session running from boot, so "
+                     "timers keep firing. Tasks set to \"At login\" will then run at boot instead, and apps need a "
+                     "desktop session, so only commands gain from this.")
+            d.add_response("later", "Not now"); d.add_response("enable", "Turn on")
+            d.set_response_appearance("enable", Adw.ResponseAppearance.SUGGESTED)
+            d.set_close_response("later"); d.set_default_response("enable")
+            d.connect("response", lambda _d, r: self.do_linger(True) if r == "enable"
+                      else setattr(self, "linger_dismissed", True) or self.show_banner())
+            d.present(self)
+
+        def do_linger(self, on):
+            def work():
+                err = set_linger(on)
+                GLib.idle_add(self.linger_done, on, err)
+            threading.Thread(target=work, daemon=True).start()
+
+        def linger_done(self, on, err):
+            self.toast(f"Could not change it: {err[:100]}" if err else
+                       ("Tasks will keep running while you're logged out" if on else "Tasks now stop when you log out"))
+            self.fill()
+            return False
+
+        def show_banner(self):
+            self.banner.set_revealed(self.linger is False and self.has_tasks
+                                     and not self.linger_dismissed)
 
         def do_install(self):
             err = install_menu()
@@ -749,8 +949,7 @@ def gui():
 
         def edit(self, m, preset=None):
             if m and m["trigger"] is None:
-                self.toast("This timer uses options the editor can't show, opening its file")
-                Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(unit_path(m["timer"])), None)
+                RawView(self, m).present(self)
             else:
                 Editor(self, m, preset).present(self)
 
@@ -769,11 +968,12 @@ def gui():
 
         def do_delete(self, names):
             snap = remove_units(names); self.fill()
+            if snap["failed"]:
+                return self.toast("Could not delete " + ", ".join(snap["failed"]))
             self.toast("Deleted", "Undo", lambda: (restore_units(snap), self.fill()))
 
         def task_row(self, m):
-            last = last_run(m["service"])
-            nxt, active = unit_status(m["timer"])
+            last, nxt, active = m["last"], m["next"], m["enabled"]
             parts = [describe(m["trigger"]) if m["trigger"] else "Custom schedule"]
             if active: parts.append(f"Next: {nxt}" if nxt else "Next: when triggered")
             else: parts.append("Disabled")
@@ -784,6 +984,8 @@ def gui():
             img = Gtk.Image(icon_name="dialog-warning-symbolic" if bad else "alarm-symbolic")
             if bad: img.add_css_class("error")
             row.add_prefix(img)
+            row.add_suffix(icon_btn("text-x-generic-symbolic", "View log",
+                                    lambda: LogView(m["service"]).present(self)))
             row.add_suffix(icon_btn("media-playback-start-symbolic", "Run now",
                                     lambda: (start_now(m), self.toast("Started"))))
             sw = Gtk.Switch(active=active, valign=Gtk.Align.CENTER)
@@ -796,22 +998,44 @@ def gui():
             row = Adw.ActionRow(title=GLib.markup_escape_text(svc), subtitle="No schedule · click to schedule or delete", activatable=True)
             row.connect("activated", lambda _r: self.edit(None, svc))
             row.add_prefix(Gtk.Image(icon_name="emblem-system-symbolic"))
+            row.add_suffix(icon_btn("text-x-generic-symbolic", "View log", lambda: LogView(svc).present(self)))
             row.add_suffix(icon_btn("media-playback-start-symbolic", "Run now",
                                     lambda: (ctl("start", "--no-block", svc), self.toast("Started"))))
             row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))     # the whole row opens its editor
             return row
 
         def fill(self):
-            for lst in (self.list, self.free_list):
-                while (r := lst.get_first_child()) is not None: lst.remove(r)
-            timers = user_timers()
-            tasks = sorted(filter(None, (load_task(t) for t in timers)), key=lambda m: m["name"].lower())
-            free = unscheduled_services(timers)
-            self.stack.set_visible_child_name("list" if tasks or free else "empty")
-            self.h1.set_visible(bool(tasks) and bool(free)); self.list.set_visible(bool(tasks))
-            self.h2.set_visible(bool(free)); self.free_list.set_visible(bool(free))
-            for m in tasks: self.list.append(self.task_row(m))
-            for s in free: self.free_list.append(self.free_row(s))
+            """Refresh the lists. systemctl runs in a thread so the window never freezes; a request that arrives
+            while one is running just triggers one more run afterwards."""
+            if self.busy: self.again = True; return
+            self.busy = True
+            def work():
+                try: data = gather()
+                except Exception: data = None
+                GLib.idle_add(self.render, data)
+            threading.Thread(target=work, daemon=True).start()
+
+        def render(self, data):
+            self.busy = False
+            if data is not None:
+                self.services, self.has_tasks = data["services"], bool(data["tasks"])
+                if data["linger"] != self.linger: self.linger = data["linger"]; self.update_menu()
+                sig = repr((data["tasks"], data["free"]))
+                if sig != self.sig:                       # unchanged: leave the list (and its scroll position) alone
+                    self.sig = sig
+                    tasks, free = data["tasks"], data["free"]
+                    for lst in (self.list, self.free_list):
+                        while (r := lst.get_first_child()) is not None: lst.remove(r)
+                    self.stack.set_visible_child_name("list" if tasks or free else "empty")
+                    self.h1.set_visible(bool(tasks) and bool(free)); self.list.set_visible(bool(tasks))
+                    self.h2.set_visible(bool(free)); self.free_list.set_visible(bool(free))
+                    for m in tasks: self.list.append(self.task_row(m))
+                    for sv in free: self.free_list.append(self.free_row(sv))
+            elif self.sig is None:                        # first load failed: don't spin forever
+                self.stack.set_visible_child_name("empty")
+            self.show_banner()
+            if self.again: self.again = False; self.fill()
+            return False
 
     class App(Adw.Application):
         def __init__(self):

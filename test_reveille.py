@@ -281,7 +281,7 @@ class Schedules(unittest.TestCase):
 
     def test_unsupported_keys_return_none(self):
         self.assertIsNone(self.parse(OnActiveSec="5min"))
-        self.assertIsNone(self.parse(OnCalendar="daily", RandomizedDelaySec="1h"))
+        self.assertIsNone(self.parse(OnCalendar="daily", RandomizedDelaySec="soon"))
 
     def test_timer_lines_roundtrip(self):
         for tr in (WEEKLY, {**rv.DEFAULT_TR, "type": "interval", "every": 2, "unit": "h"}, {**rv.DEFAULT_TR, "type": "login"}):
@@ -379,6 +379,160 @@ class Naming(Base):
     def test_unscheduled_services_exclude_triggered_ones(self):
         write("a.service", SIMPLE_SERVICE); write("b.service", SIMPLE_SERVICE); write("a.timer", SIMPLE_TIMER)
         self.assertEqual(rv.unscheduled_services(rv.user_timers()), ["b.service"])
+
+
+class Fixes(Editable):
+    """Regressions found in review."""
+    def test_graphical_session_dependency_survives_a_save(self):
+        svc = SIMPLE_SERVICE.replace("[Unit]\n", "[Unit]\nAfter=graphical-session.target\n")
+        m = self.load(svc)
+        out, _ = self.save(m, adv={**m["adv"], "online": True})
+        self.assertIn("After=graphical-session.target", out)
+        self.assertIn("After=network-online.target", out)
+
+    def test_dollar_is_not_doubled_in_environment(self):
+        rv.apply_task(task(adv={"env": "A=p$q B=100%"}))
+        svc = read(f"{rv.UNITS}/backup.service")
+        self.assertIn("A=p$q", svc); self.assertNotIn("$$q", svc)
+        self.assertIn("B=100%%", svc)
+        self.assertEqual(rv.load_task("backup.timer")["adv"]["env"], "'A=p$q' B=100%")
+
+    def test_time_spans(self):
+        for text, secs in (("90", 90), ("30s", 30), ("5min", 300), ("1h", 3600), ("1h 30min", 5400), ("2d", 172800)):
+            self.assertEqual(rv.parse_span(text), secs, text)
+        for bad in ("", "soon", "5 parsecs", "min"): self.assertIsNone(rv.parse_span(bad), bad)
+
+    def test_randomized_delay_in_minutes_is_editable(self):
+        tim = SIMPLE_TIMER.replace("[Install]", "RandomizedDelaySec=5min\n\n[Install]")
+        m = self.load(SIMPLE_SERVICE, tim)
+        self.assertTrue(m["full"]); self.assertEqual(m["adv"]["delay"], 300)
+
+    def test_schedule_only_rewrite_handles_continuation_lines(self):
+        tim = "[Timer]\nOnCalendar=Mon \\\n  *-*-* 03:00:00\nAccuracySec=1s\n[Install]\nWantedBy=timers.target\n"
+        write("x.timer", tim)
+        self.assertIsNone(rv.rewrite_timer("x.timer", {**rv.DEFAULT_TR, "hour": 5}, True, 0))
+        out = rv.read_text(f"{rv.UNITS}/x.timer")
+        self.assertIn("OnCalendar=*-*-* 05:00:00", out)
+        self.assertNotIn("Mon", out); self.assertIn("AccuracySec=1s", out)
+        self.assertEqual(rv.read_text(f"{rv.UNITS}/x.timer.reveille-bak"), tim)
+
+    def test_write_error_is_reported_not_raised(self):
+        write("x.service", SIMPLE_SERVICE); write("x.timer", SIMPLE_TIMER)
+        m = rv.load_task("x.timer")
+        os.chmod(rv.UNITS, 0o500)
+        try:
+            if os.access(rv.UNITS, os.W_OK): self.skipTest("running as root")
+            t = {k: m[k] for k in ("unit", "name", "kind", "trigger", "catchup", "enabled", "adv", "service")}
+            t.update(command=m["command"], app="", keep_exec=True)
+            self.assertIn("Could not write", rv.apply_task(t))
+        finally: os.chmod(rv.UNITS, 0o700)
+
+    def test_write_is_atomic_and_follows_symlinks(self):
+        os.makedirs(rv.UNITS, exist_ok=True)
+        real = os.path.join(TMP, "real.timer")
+        with open(real, "w") as f: f.write("old")
+        os.symlink(real, f"{rv.UNITS}/l.timer")
+        rv.write_atomic(f"{rv.UNITS}/l.timer", "new")
+        self.assertTrue(os.path.islink(f"{rv.UNITS}/l.timer")); self.assertEqual(read(real), "new")
+        self.assertEqual([n for n in os.listdir(rv.UNITS) if n.startswith(".reveille-")], [])
+
+    def test_failed_delete_is_reported(self):
+        write("x.service", SIMPLE_SERVICE)
+        os.chmod(rv.UNITS, 0o500)
+        try:
+            if os.access(rv.UNITS, os.W_OK): self.skipTest("running as root")
+            snap = rv.remove_units(["x.service"])
+        finally: os.chmod(rv.UNITS, 0o700)
+        self.assertEqual(snap["failed"], ["x.service"]); self.assertEqual(snap["items"], [])
+
+
+class Proc:
+    """A stand-in for subprocess.CompletedProcess."""
+    def __init__(self, stdout="", stderr="", returncode=0): self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+class Helpers(unittest.TestCase):
+    """loginctl and journalctl, with the process runner stubbed."""
+    def setUp(self):
+        self.calls, self._sh, self.reply = [], rv.sh, Proc()
+        def fake(*cmd, **kw): self.calls.append(cmd); return self.reply
+        rv.sh = fake
+
+    def tearDown(self): rv.sh = self._sh
+
+    def test_linger_state(self):
+        for out, want in (("Linger=yes\n", True), ("Linger=no\n", False), ("", None), ("Name=x\n", None)):
+            self.reply = Proc(stdout=out); self.assertIs(rv.linger_state(), want, out)
+        self.assertEqual(self.calls[-1][:2], ("loginctl", "show-user"))
+        self.reply = Proc(stderr="no such user", returncode=1); self.assertIsNone(rv.linger_state())
+        rv.sh = lambda *a, **k: None; self.assertIsNone(rv.linger_state())       # loginctl missing
+
+    def test_set_linger(self):
+        self.assertIsNone(rv.set_linger(True)); self.assertEqual(self.calls[-1][:2], ("loginctl", "enable-linger"))
+        self.assertIsNone(rv.set_linger(False)); self.assertEqual(self.calls[-1][:2], ("loginctl", "disable-linger"))
+        self.reply = Proc(stderr="Access denied\n", returncode=1); self.assertEqual(rv.set_linger(True), "Access denied")
+        rv.sh = lambda *a, **k: None; self.assertEqual(rv.set_linger(True), "loginctl is not available")
+
+    def test_read_log_returns_the_journal_text(self):
+        self.reply = Proc(stdout="2026-11-09T03:00:01-0300 host x[1]: hello\n")
+        self.assertEqual(rv.read_log("x.service"), ("2026-11-09T03:00:01-0300 host x[1]: hello", None))
+        cmd = self.calls[-1]
+        self.assertEqual(cmd[:2], ("journalctl", "--user")); self.assertIn("--unit=x.service", cmd)
+        self.assertEqual(cmd[cmd.index("-n") + 1], "200")
+
+    def test_read_log_is_safe_for_odd_unit_names(self):
+        rv.read_log("-n.service")
+        self.assertIn("--unit=-n.service", self.calls[-1])                      # never a loose option
+
+    def test_empty_log_explains_itself(self):
+        for out in ("", "  \n", "-- No entries --\n"):
+            self.reply = Proc(stdout=out); text, err = rv.read_log("x.service")
+            self.assertIsNone(err); self.assertIn("journalctl --user -u x.service", text)
+
+    def test_log_errors_are_returned_not_raised(self):
+        self.reply = Proc(stderr="Failed to open journal", returncode=1)
+        self.assertEqual(rv.read_log("x.service"), ("", "Failed to open journal"))
+        rv.sh = lambda *a, **k: None
+        self.assertEqual(rv.read_log("x.service")[0], "")
+
+
+class Gather(Base):
+    """The window's data comes from one batched systemctl call per kind of unit."""
+    SHOW_TIMERS = ("Id=a.timer\nActiveState=active\nNextElapseUSecRealtime=Tue 2026-11-10 03:00:00 -03\n\n"
+                   "Id=b.timer\nActiveState=inactive\nNextElapseUSecRealtime=\n")
+    SHOW_SERVICES = ("Id=a.service\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=Mon 2026-11-09 03:00:01 -03\n\n"
+                     "Id=b.service\nResult=exit-code\nExecMainStatus=3\nExecMainExitTimestamp=Mon 2026-11-09 04:00:00 -03\n")
+
+    def setUp(self):
+        super().setUp()
+        self.shows = []
+        def ctl(*a):
+            if a[0] == "show":
+                self.shows.append(a)
+                out = self.SHOW_TIMERS if a[1].endswith(".timer") else self.SHOW_SERVICES
+                return type("R", (), {"returncode": 0, "stderr": "", "stdout": out})()
+            return fake_ctl(*a)
+        self._old, rv.ctl = rv.ctl, ctl
+        self._sh, rv.sh = rv.sh, lambda *a, **k: Proc(stdout="Linger=no\n")
+
+    def tearDown(self): rv.ctl, rv.sh = self._old, self._sh
+
+    def test_show_many_splits_blocks_by_unit(self):
+        r = rv.show_many(["a.timer", "b.timer"], "ActiveState")
+        self.assertEqual(r["a.timer"]["ActiveState"], "active"); self.assertEqual(r["b.timer"]["ActiveState"], "inactive")
+        self.assertEqual(rv.show_many([], "ActiveState"), {})
+
+    def test_gather_uses_two_show_calls_for_any_number_of_tasks(self):
+        for n in "ab": write(f"{n}.service", SIMPLE_SERVICE); write(f"{n}.timer", SIMPLE_TIMER)
+        write("c.service", SIMPLE_SERVICE)
+        d = rv.gather()
+        self.assertEqual(len(self.shows), 2)
+        a, b = d["tasks"]
+        self.assertEqual((a["timer"], a["enabled"], a["next"]), ("a.timer", True, "Tue 2026-11-10 03:00:00 -03"))
+        self.assertEqual(a["last"], {"time": "Mon 2026-11-09 03:00:01 -03", "rc": 0})
+        self.assertEqual((b["enabled"], b["next"], b["last"]["rc"]), (False, "", 3))
+        self.assertEqual(d["free"], ["c.service"])
+        self.assertIs(d["linger"], False)
 
 
 if __name__ == "__main__":
