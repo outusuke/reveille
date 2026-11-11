@@ -1,4 +1,4 @@
-#: layer 09: app-menu entry install and removal
+#: layer 10: app-menu entry install and removal
 # ---------------------------------------------------------------- app menu
 def menu_installed():
     return os.path.isfile(DESKTOP)

@@ -1,4 +1,4 @@
-#: layer 10: the GTK4/libadwaita window (one function; its classes close over its imports)
+#: layer 11: the GTK4/libadwaita window (one function; its classes close over its imports)
 # ---------------------------------------------------------------- GUI
 def gui():
     import gi
@@ -407,6 +407,54 @@ def gui():
             buf = self.text.get_buffer()
             self.get_clipboard().set_text(buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False))
 
+    class ImportCron(Adw.Dialog):
+        """Review the entries of a crontab and turn the chosen ones into tasks. The crontab itself is never changed."""
+        def __init__(self, win, plan):
+            super().__init__(title="Import from crontab", content_width=560, content_height=680)
+            self.win, self.plan, self.checks = win, plan, []
+            page = Adw.PreferencesPage()
+            notes = ["Your crontab is not changed: remove the lines you import yourself, or the jobs run twice."] + cron_notes(plan)
+            page.add(Adw.PreferencesGroup(description=GLib.markup_escape_text("\n".join(notes))))
+            g = Adw.PreferencesGroup(title="Entries"); page.add(g)
+            for it in plan:
+                title, sub = cron_row_texts(it)
+                row = Adw.ActionRow(title=GLib.markup_escape_text(title), subtitle=GLib.markup_escape_text(sub))
+                ok = it["status"] == "new"                 # only a new entry can be chosen
+                chk = Gtk.CheckButton(valign=Gtk.Align.CENTER, active=ok, sensitive=ok)
+                chk.connect("toggled", self.refresh)
+                row.add_prefix(chk); row.set_activatable_widget(chk)
+                self.checks.append(chk); g.add(row)
+            g = Adw.PreferencesGroup(); page.add(g)
+            self.on = Adw.SwitchRow(title="Switch the new timers on", active=False,
+                                    subtitle="Leave this off until the cron lines are gone. Every task has its own switch in the list.")
+            g.add(self.on)
+            hb = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
+            cancel = Gtk.Button(label="Cancel"); cancel.connect("clicked", lambda *_: self.close()); hb.pack_start(cancel)
+            self.btn = Gtk.Button(label="Import"); self.btn.add_css_class("suggested-action")
+            self.btn.connect("clicked", lambda *_: self.go()); hb.pack_end(self.btn)
+            tv = Adw.ToolbarView(content=page); tv.add_top_bar(hb)
+            self.set_child(tv)
+            self.refresh()
+
+        def chosen(self):
+            return [it for it, c in zip(self.plan, self.checks) if it["status"] == "new" and c.get_active()]
+
+        def refresh(self, *_):
+            n = len(self.chosen())
+            self.btn.set_label(f"Import {n}" if n else "Import"); self.btn.set_sensitive(n > 0)
+
+        def go(self):
+            chosen, enabled = self.chosen(), self.on.get_active()
+            if not chosen: return
+            self.set_sensitive(False)
+            self.win.bg(lambda: import_crontab(chosen, enabled=enabled), lambda res: self.done(res, enabled))
+
+        def done(self, res, enabled):
+            self.set_sensitive(True)
+            if isinstance(res, Exception): return self.win.toast(f"Could not import: {res}"[:120])
+            self.close(); self.win.fill()
+            self.win.toast(import_summary(res, enabled)[:140])
+
     class Win(Adw.ApplicationWindow):
         def __init__(self, app):
             super().__init__(application=app, title="Task Scheduler", default_width=640, default_height=560)
@@ -418,7 +466,8 @@ def gui():
             hb.pack_end(self.menu_btn)
             self.linger, self.linger_dismissed = None, False
             for name, fn in (("install-menu", self.do_install), ("remove-menu", self.do_remove),
-                             ("linger-on", lambda: self.do_linger(True)), ("linger-off", lambda: self.do_linger(False))):
+                             ("linger-on", lambda: self.do_linger(True)), ("linger-off", lambda: self.do_linger(False)),
+                             ("import-cron", self.import_cron)):
                 a = Gio.SimpleAction.new(name, None); a.connect("activate", lambda *_a, fn=fn: fn()); self.add_action(a)
             self.update_menu()
             tv.add_top_bar(hb)
@@ -443,7 +492,7 @@ def gui():
             self.stack.add_named(empty, "empty"); self.stack.add_named(Gtk.ScrolledWindow(child=clamp), "list")
             tv.set_content(self.stack); self.overlay.set_child(tv); self.set_content(self.overlay)
             self.services, self.busy, self.again, self.shape, self.has_tasks = [], False, False, None, False
-            self.opening = False
+            self.opening = self.importing = False
             self.sdver = None
             self.cur, self.rows, self.syncing = {}, {}, False
             self.stack.set_visible_child_name("loading")
@@ -452,6 +501,7 @@ def gui():
 
         def update_menu(self):
             m = Gio.Menu()
+            m.append("Import from crontab…", "win.import-cron")
             if menu_installed(): m.append("Remove from app menu", "win.remove-menu")
             else: m.append("Add to app menu", "win.install-menu")
             if self.linger is True: m.append("Don't run tasks while logged out", "win.linger-off")
@@ -516,6 +566,24 @@ def gui():
                 if cur and cur["trigger"] is None: RawView(self, cur).present(self)
                 else: Editor(self, cur, preset).present(self)
             self.bg(list_services, done)
+
+        def import_cron(self):
+            """Read and convert the crontab off the main thread (it asks systemd to check every schedule), then
+            open the review dialog."""
+            if self.importing: return
+            self.importing = True
+            def work():
+                text, err = read_crontab()
+                return err, (None if err else crontab_plan(text))
+            self.bg(work, self.cron_ready)
+
+        def cron_ready(self, res):
+            self.importing = False
+            if isinstance(res, Exception): return self.toast(f"Could not read the crontab: {res}"[:120])
+            err, plan = res
+            if err: return self.toast(err[:120])
+            if not plan: return self.toast("No crontab entries found")
+            ImportCron(self, plan).present(self)
 
         def ask_delete(self, name):
             names = delete_plan(name)

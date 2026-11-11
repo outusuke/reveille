@@ -1,4 +1,4 @@
-#: layer 11: command line, main(), the __main__ guard
+#: layer 12: command line, main(), the __main__ guard
 def cmd_services():
     """Diagnostics: what the service picker sees."""
     print(f"running: {SELF}\ninstalled copy: {INSTALLED} ({'exists' if os.path.isfile(INSTALLED) else 'none'})")
@@ -35,6 +35,27 @@ def cmd_run(name):
     print(f"Could not start {service}: {err}" if err else f"Started {service}", file=sys.stderr if err else sys.stdout)
     return 1 if err else 0
 
+def cmd_import_cron(path, apply, disabled):
+    """Preview, or with --apply create, tasks from a crontab. The crontab itself is never changed."""
+    text, err = read_crontab(path)
+    if err: print(err, file=sys.stderr); return 1
+    plan = crontab_plan(text)
+    if not plan: print("No cron entries found"); return 0
+    print(crontab_report(plan))
+    new = sum(it["status"] == "new" for it in plan)
+    if not apply:
+        print(f"\nPreview only, nothing was written. {new} of {len(plan)} can be imported" + ("; add --apply to create them." if new else "."))
+        return 0
+    if not new: print("\nNothing to import."); return 0
+    failed = 0
+    print()
+    for it, unit, err in import_crontab(plan, enabled=not disabled):
+        failed += bool(err)
+        print(f"Problem with {it['name']!r} ({unit}): {err}" if err else f"Created {unit}.timer: {it['name']}")
+    print("\nYour crontab was not changed. " + ("The new timers are off: turn each on in reveille when you remove its cron line."
+          if disabled else "Remove the imported lines (crontab -e) or those jobs will run twice."))
+    return 1 if failed else 0
+
 def cmd_menu(install):
     err = install_menu() if install else uninstall_menu()
     print(err or ("Added to the app menu" if install else "Removed from the app menu"))
@@ -60,6 +81,10 @@ def build_parser():
     sub.add_parser("list", help="print every task with its schedule, next run and last result")
     r = sub.add_parser("run", help="run a task or service now")
     r.add_argument("name", help="task name or unit name, as shown by 'list'")
+    c = sub.add_parser("import-cron", help="turn crontab entries into tasks (preview unless --apply)")
+    c.add_argument("--file", metavar="FILE", help="read this crontab file instead of 'crontab -l' (- for standard input)")
+    c.add_argument("--apply", action="store_true", help="create the tasks (the default only shows what would happen)")
+    c.add_argument("--disabled", action="store_true", help="with --apply: create the timers switched off")
     return ap
 
 def main(argv=None):
@@ -67,6 +92,7 @@ def main(argv=None):
     if args.cmd == "services": return cmd_services()
     if args.cmd == "list": return cmd_list()
     if args.cmd == "run": return cmd_run(args.name)
+    if args.cmd == "import-cron": return cmd_import_cron(args.file, args.apply, args.disabled)
     if args.cmd in ("install", "uninstall"): return cmd_menu(args.cmd == "install")
     return cmd_gui()
 

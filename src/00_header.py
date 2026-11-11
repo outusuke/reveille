@@ -11,6 +11,7 @@ in ~/.config/systemd/user. Nothing else is kept on disk, and the timers never ca
   reveille services     list what the service picker finds (for troubleshooting)
   reveille list         print every task with its schedule, next run and last result
   reveille run NAME     run a task or service now
+  reveille import-cron  turn crontab entries into tasks (preview; --apply creates them)
   reveille --version
 """
 import argparse, datetime, os, re, shlex, shutil, subprocess, sys, tempfile, threading, time
