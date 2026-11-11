@@ -18,7 +18,8 @@ INTERVAL_UNITS = {"s": 1, "min": 60, "h": 3600, "d": 86400}      # in seconds; t
 EVERY_NAMES = {"s": ("second", "seconds"), "min": ("minute", "minutes"), "h": ("hour", "hours"), "d": ("day", "days")}
 MAX_EVERY = 9999                    # what the "Every" box can hold; a longer interval isn't shown, so it isn't edited
 DEFAULT_TR = {"type": "daily", "hour": 3, "minute": 0, "days": ["Mon"], "dom": 1, "every": 30, "unit": "min", "expr": "",
-              "times": ["09:00", "17:00"], "login_sec": 10}
+              "times": ["09:00", "17:00"], "login_sec": 10,
+              "first_sec": None, "first_key": None}   # interval only: first run if it differs from the interval; its key
 
 SCHEDULE_KEYS = ("OnCalendar", "OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnActiveSec", "OnUnitInactiveSec",
                  "Persistent", "RandomizedDelaySec")

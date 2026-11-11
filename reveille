@@ -34,7 +34,8 @@ INTERVAL_UNITS = {"s": 1, "min": 60, "h": 3600, "d": 86400}      # in seconds; t
 EVERY_NAMES = {"s": ("second", "seconds"), "min": ("minute", "minutes"), "h": ("hour", "hours"), "d": ("day", "days")}
 MAX_EVERY = 9999                    # what the "Every" box can hold; a longer interval isn't shown, so it isn't edited
 DEFAULT_TR = {"type": "daily", "hour": 3, "minute": 0, "days": ["Mon"], "dom": 1, "every": 30, "unit": "min", "expr": "",
-              "times": ["09:00", "17:00"], "login_sec": 10}
+              "times": ["09:00", "17:00"], "login_sec": 10,
+              "first_sec": None, "first_key": None}   # interval only: first run if it differs from the interval; its key
 
 SCHEDULE_KEYS = ("OnCalendar", "OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnActiveSec", "OnUnitInactiveSec",
                  "Persistent", "RandomizedDelaySec")
@@ -308,7 +309,9 @@ def describe(tr):
     if t == "custom": return tr.get("expr", "custom schedule")
     if t == "interval":
         one, many = EVERY_NAMES.get(tr.get("unit"), EVERY_NAMES["min"]); n = int(tr.get("every", 1))
-        return f"Every {one}" if n == 1 else f"Every {n} {many}"
+        text = f"Every {one}" if n == 1 else f"Every {n} {many}"
+        first = tr.get("first_sec")
+        return text if first is None or first == interval_seconds(tr) else f"{text}, first run {human_span(first)} after login"
     sec = int(tr.get("login_sec", 10))
     return "At login" if sec in (0, 10) else f"At login, after {human_span(sec)}"
 
@@ -332,7 +335,8 @@ def next_elapse(tr):
             res.append(nxt.group(1).strip() + (f"  ({left.group(1).strip()})" if left else ""))
         return "\n".join(res) if res else "Not a valid schedule"
     if tr["type"] == "interval":
-        return f"First run {human_span(interval_seconds(tr))} after login, then repeats"
+        first = tr.get("first_sec")
+        return f"First run {human_span(interval_seconds(tr) if first is None else first)} after login, then repeats"
     sec = int(tr.get("login_sec", 10))
     return "Shortly after you log in" if sec <= 60 else f"{human_span(sec)} after you log in"
 
@@ -351,7 +355,10 @@ def timer_lines(tr, catchup, delay):
     elif tr["type"] == "interval":
         secs = interval_seconds(tr)
         if secs < 1: raise ValueError("The interval must be at least one second")
-        out += [f"OnStartupSec={fmt_span(secs)}", f"OnUnitActiveSec={fmt_span(secs)}"]
+        first = tr.get("first_sec")
+        if first is not None and first < 0: raise ValueError("The first run can't be negative")
+        key = tr.get("first_key") or "OnStartupSec"      # keep the key a hand-written timer used (OnBootSec= counts from boot)
+        out += [f"{key}={fmt_span(secs if first is None else first)}", f"OnUnitActiveSec={fmt_span(secs)}"]
         if needs_precision(secs): out.append("AccuracySec=1s")
     else:
         out.append(f"OnStartupSec={fmt_span(int(tr.get('login_sec', 10)))}")
@@ -432,10 +439,15 @@ def parse_schedule(kv):
             tr = {"type": "custom", "expr": " | ".join(cals)}
     elif not cals and len(active) == 1 and len(start) <= 1:
         total = exact_span(active[0])
-        if not total or (start and exact_span(start[0]) != total): return None
+        if not total: return None
         step = split_interval(total)
         if not step: return None
         tr = {"type": "interval", "every": step[0], "unit": step[1]}
+        if start:                                       # a first run that differs from the interval is shown, not refused
+            first = exact_span(start[0])
+            if first is None: return None
+            if first != total: tr["first_sec"] = first
+            if "OnBootSec" in kv: tr["first_key"] = "OnBootSec"
     elif not cals and not active and len(start) == 1:
         sec = exact_span(start[0])
         if sec is None: return None
@@ -1242,6 +1254,10 @@ def gui():
             self.unit = Adw.ComboRow(title="Unit", model=Gtk.StringList.new([EVERY_NAMES[u][1] for u in INTERVAL_UNITS]),
                                      selected=list(INTERVAL_UNITS).index(tr["unit"]) if tr["unit"] in INTERVAL_UNITS else 1)
             self.login_sec = tr["login_sec"]               # not editable here, but a hand-set delay must survive a save
+            self.first_key = tr.get("first_key")           # likewise the key (OnBootSec=) a hand-written timer used
+            self.first = Adw.EntryRow(title="First run after login (optional, e.g. 2min; empty = same as Every)",
+                                      text="" if tr.get("first_sec") is None else fmt_span(tr["first_sec"]))
+            self.first.connect("changed", self.refresh)
             self.times = Adw.EntryRow(title="Times (e.g. 08:00, 12:30, 18:00)", text=", ".join(tr["times"]))
             self.times.connect("changed", self.refresh)
             self.days_row = Adw.ActionRow(title="Days")
@@ -1252,7 +1268,7 @@ def gui():
             self.days_row.add_suffix(box)
             self.expr = Adw.EntryRow(title="Calendar expression (e.g. Mon..Fri 09:00; separate several with |)", text=tr["expr"])
             self.expr.connect("changed", self.refresh)
-            self.when = [self.hour, self.minute, self.days_row, self.dom, self.times, self.every, self.unit, self.expr]
+            self.when = [self.hour, self.minute, self.days_row, self.dom, self.times, self.every, self.unit, self.first, self.expr]
             for r in self.when: g.add(r)
             self.preview = Adw.ActionRow(title="Next run", subtitle_selectable=True)
             self.preview.add_css_class("property"); g.add(self.preview)
@@ -1332,7 +1348,15 @@ def gui():
                     "days": [d for d, b in self.day_btns.items() if b.get_active()],
                     "dom": int(self.dom.get_value()), "every": int(self.every.get_value()),
                     "unit": list(INTERVAL_UNITS)[self.unit.get_selected()],
-                    "times": parse_times(self.times.get_text()) or [], "login_sec": self.login_sec}
+                    "times": parse_times(self.times.get_text()) or [], "login_sec": self.login_sec,
+                    "first_sec": self.first_span()[1], "first_key": self.first_key}
+
+        def first_span(self):
+            """(valid, seconds or None) for the "First run" box: empty means the same as the interval."""
+            text = self.first.get_text().strip()
+            if not text: return True, None
+            secs = exact_span(text)
+            return secs is not None, secs
 
         def refresh(self, *_):
             k = self.kind.get_selected()
@@ -1345,7 +1369,7 @@ def gui():
             tp = TRIGGER_IDS[self.trig.get_selected()]
             clock = tp in ("daily", "weekdays", "weekly", "monthly", "lastday")
             show = {self.hour: clock, self.minute: clock, self.days_row: tp == "weekly", self.dom: tp == "monthly",
-                    self.times: tp == "times", self.every: tp == "interval", self.unit: tp == "interval",
+                    self.times: tp == "times", self.every: tp == "interval", self.unit: tp == "interval", self.first: tp == "interval",
                     self.expr: tp == "custom"}
             for w, v in show.items(): w.set_visible(v)
             # "Run missed tasks" only means something for a calendar schedule: an interval or a login has no missed time
@@ -1375,6 +1399,8 @@ def gui():
             if tr["type"] == "custom" and not calendar_parts(tr["expr"]):
                 return self.win.toast("That is not a valid calendar expression")
             if tr["type"] == "weekly" and not tr["days"]: return self.win.toast("Pick at least one day")
+            if tr["type"] == "interval" and not self.first_span()[0]:
+                return self.win.toast("First run: use a time like 2min, 90s or 1h")
             if tr["type"] == "times" and not tr["times"]: return self.win.toast("Enter times like 08:00, 12:30")
             if not self.full:
                 timer, catchup, delay = self.m["timer"], self.catchup.get_active(), int(self.delay.get_value())

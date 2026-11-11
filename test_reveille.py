@@ -1144,11 +1144,23 @@ class Intervals(Base):
         self.assertEqual(self.trig(OnUnitActiveSec="24h"), ("interval", 1, "d"))
         self.assertEqual(self.trig(OnStartupSec="1h 30min", OnUnitActiveSec="90min"), ("interval", 90, "min"))
 
+    def test_a_different_first_run_is_shown_and_kept(self):
+        tr = self.parse(OnBootSec="2min", OnUnitActiveSec="15min")[0]
+        self.assertEqual((tr["type"], tr["every"], tr["unit"], tr["first_sec"], tr["first_key"]), ("interval", 15, "min", 120, "OnBootSec"))
+        self.assertEqual(rv.describe(tr), "Every 15 minutes, first run 2 min after login")
+        self.assertEqual(rv.timer_lines(tr, True, 0)[:2], ["OnBootSec=2min", "OnUnitActiveSec=15min"])
+        same = self.parse(OnStartupSec="15min", OnUnitActiveSec="15min")[0]          # unchanged behavior when equal
+        self.assertIsNone(same["first_sec"]); self.assertEqual(rv.describe(same), "Every 15 minutes")
+        self.assertEqual(rv.timer_lines(same, True, 0)[0], "OnStartupSec=15min")
+        zero = {**rv.DEFAULT_TR, "type": "interval", "every": 15, "unit": "min", "first_sec": 0}
+        self.assertEqual(rv.timer_lines(zero, True, 0)[:2], ["OnStartupSec=0", "OnUnitActiveSec=15min"])
+        with self.assertRaises(ValueError): rv.timer_lines({**zero, "first_sec": -1}, True, 0)
+
     def test_what_cannot_be_shown_stays_unedited(self):
         self.assertIsNone(self.parse(OnUnitActiveSec="0"))
         self.assertIsNone(self.parse(OnUnitActiveSec="500ms"))
         self.assertIsNone(self.parse(OnUnitActiveSec="soon"))
-        self.assertIsNone(self.parse(OnUnitActiveSec="30min", OnStartupSec="5min"))       # a different first run
+        self.assertIsNone(self.parse(OnUnitActiveSec="30min", OnStartupSec="soon"))       # a first run that isn't a time
         self.assertIsNone(self.parse(OnUnitActiveSec=f"{rv.MAX_EVERY + 1}s"))              # longer than the box holds
         self.assertIsNone(self.parse(OnUnitActiveSec=["5min", "10min"]))
 

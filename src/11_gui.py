@@ -78,6 +78,10 @@ def gui():
             self.unit = Adw.ComboRow(title="Unit", model=Gtk.StringList.new([EVERY_NAMES[u][1] for u in INTERVAL_UNITS]),
                                      selected=list(INTERVAL_UNITS).index(tr["unit"]) if tr["unit"] in INTERVAL_UNITS else 1)
             self.login_sec = tr["login_sec"]               # not editable here, but a hand-set delay must survive a save
+            self.first_key = tr.get("first_key")           # likewise the key (OnBootSec=) a hand-written timer used
+            self.first = Adw.EntryRow(title="First run after login (optional, e.g. 2min; empty = same as Every)",
+                                      text="" if tr.get("first_sec") is None else fmt_span(tr["first_sec"]))
+            self.first.connect("changed", self.refresh)
             self.times = Adw.EntryRow(title="Times (e.g. 08:00, 12:30, 18:00)", text=", ".join(tr["times"]))
             self.times.connect("changed", self.refresh)
             self.days_row = Adw.ActionRow(title="Days")
@@ -88,7 +92,7 @@ def gui():
             self.days_row.add_suffix(box)
             self.expr = Adw.EntryRow(title="Calendar expression (e.g. Mon..Fri 09:00; separate several with |)", text=tr["expr"])
             self.expr.connect("changed", self.refresh)
-            self.when = [self.hour, self.minute, self.days_row, self.dom, self.times, self.every, self.unit, self.expr]
+            self.when = [self.hour, self.minute, self.days_row, self.dom, self.times, self.every, self.unit, self.first, self.expr]
             for r in self.when: g.add(r)
             self.preview = Adw.ActionRow(title="Next run", subtitle_selectable=True)
             self.preview.add_css_class("property"); g.add(self.preview)
@@ -168,7 +172,15 @@ def gui():
                     "days": [d for d, b in self.day_btns.items() if b.get_active()],
                     "dom": int(self.dom.get_value()), "every": int(self.every.get_value()),
                     "unit": list(INTERVAL_UNITS)[self.unit.get_selected()],
-                    "times": parse_times(self.times.get_text()) or [], "login_sec": self.login_sec}
+                    "times": parse_times(self.times.get_text()) or [], "login_sec": self.login_sec,
+                    "first_sec": self.first_span()[1], "first_key": self.first_key}
+
+        def first_span(self):
+            """(valid, seconds or None) for the "First run" box: empty means the same as the interval."""
+            text = self.first.get_text().strip()
+            if not text: return True, None
+            secs = exact_span(text)
+            return secs is not None, secs
 
         def refresh(self, *_):
             k = self.kind.get_selected()
@@ -181,7 +193,7 @@ def gui():
             tp = TRIGGER_IDS[self.trig.get_selected()]
             clock = tp in ("daily", "weekdays", "weekly", "monthly", "lastday")
             show = {self.hour: clock, self.minute: clock, self.days_row: tp == "weekly", self.dom: tp == "monthly",
-                    self.times: tp == "times", self.every: tp == "interval", self.unit: tp == "interval",
+                    self.times: tp == "times", self.every: tp == "interval", self.unit: tp == "interval", self.first: tp == "interval",
                     self.expr: tp == "custom"}
             for w, v in show.items(): w.set_visible(v)
             # "Run missed tasks" only means something for a calendar schedule: an interval or a login has no missed time
@@ -211,6 +223,8 @@ def gui():
             if tr["type"] == "custom" and not calendar_parts(tr["expr"]):
                 return self.win.toast("That is not a valid calendar expression")
             if tr["type"] == "weekly" and not tr["days"]: return self.win.toast("Pick at least one day")
+            if tr["type"] == "interval" and not self.first_span()[0]:
+                return self.win.toast("First run: use a time like 2min, 90s or 1h")
             if tr["type"] == "times" and not tr["times"]: return self.win.toast("Enter times like 08:00, 12:30")
             if not self.full:
                 timer, catchup, delay = self.m["timer"], self.catchup.get_active(), int(self.delay.get_value())

@@ -71,7 +71,7 @@ User timers only run while your user session is running. When you are logged out
 
 - **Daily**, **Weekdays** (Mon to Fri), **Weekly** (pick the days), **Monthly** (day 1 to 28) and **Last day of the month**, each at a time you choose.
 - **Several times a day**: a list of clock times such as `08:00, 12:30, 18:00`, written as one `OnCalendar=` line per time.
-- **At an interval**: every N seconds, minutes, hours or days. A hand-written `1h 30min` is read as 90 minutes. An interval that isn't a whole number of minutes also gets `AccuracySec=1s`, because systemd would otherwise let it fire up to a minute late. Changing such a task to another schedule leaves that line in place.
+- **At an interval**: every N seconds, minutes, hours or days. Optionally set a different "First run after login" (for example `OnBootSec=2min` with `OnUnitActiveSec=15min`); leave it empty to start after one interval. A hand-written `OnBootSec=` is kept as `OnBootSec=` when you save. A hand-written `1h 30min` is read as 90 minutes. An interval that isn't a whole number of minutes also gets `AccuracySec=1s`, because systemd would otherwise let it fire up to a minute late. Changing such a task to another schedule leaves that line in place.
 - **At login**: shortly after the session starts. A delay other than the default 10 seconds that you wrote by hand is kept when you save.
 - **Custom**: any systemd calendar expression; separate several with `|`.
 

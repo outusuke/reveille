@@ -35,7 +35,9 @@ def describe(tr):
     if t == "custom": return tr.get("expr", "custom schedule")
     if t == "interval":
         one, many = EVERY_NAMES.get(tr.get("unit"), EVERY_NAMES["min"]); n = int(tr.get("every", 1))
-        return f"Every {one}" if n == 1 else f"Every {n} {many}"
+        text = f"Every {one}" if n == 1 else f"Every {n} {many}"
+        first = tr.get("first_sec")
+        return text if first is None or first == interval_seconds(tr) else f"{text}, first run {human_span(first)} after login"
     sec = int(tr.get("login_sec", 10))
     return "At login" if sec in (0, 10) else f"At login, after {human_span(sec)}"
 
@@ -59,7 +61,8 @@ def next_elapse(tr):
             res.append(nxt.group(1).strip() + (f"  ({left.group(1).strip()})" if left else ""))
         return "\n".join(res) if res else "Not a valid schedule"
     if tr["type"] == "interval":
-        return f"First run {human_span(interval_seconds(tr))} after login, then repeats"
+        first = tr.get("first_sec")
+        return f"First run {human_span(interval_seconds(tr) if first is None else first)} after login, then repeats"
     sec = int(tr.get("login_sec", 10))
     return "Shortly after you log in" if sec <= 60 else f"{human_span(sec)} after you log in"
 
@@ -78,7 +81,10 @@ def timer_lines(tr, catchup, delay):
     elif tr["type"] == "interval":
         secs = interval_seconds(tr)
         if secs < 1: raise ValueError("The interval must be at least one second")
-        out += [f"OnStartupSec={fmt_span(secs)}", f"OnUnitActiveSec={fmt_span(secs)}"]
+        first = tr.get("first_sec")
+        if first is not None and first < 0: raise ValueError("The first run can't be negative")
+        key = tr.get("first_key") or "OnStartupSec"      # keep the key a hand-written timer used (OnBootSec= counts from boot)
+        out += [f"{key}={fmt_span(secs if first is None else first)}", f"OnUnitActiveSec={fmt_span(secs)}"]
         if needs_precision(secs): out.append("AccuracySec=1s")
     else:
         out.append(f"OnStartupSec={fmt_span(int(tr.get('login_sec', 10)))}")
@@ -159,10 +165,15 @@ def parse_schedule(kv):
             tr = {"type": "custom", "expr": " | ".join(cals)}
     elif not cals and len(active) == 1 and len(start) <= 1:
         total = exact_span(active[0])
-        if not total or (start and exact_span(start[0]) != total): return None
+        if not total: return None
         step = split_interval(total)
         if not step: return None
         tr = {"type": "interval", "every": step[0], "unit": step[1]}
+        if start:                                       # a first run that differs from the interval is shown, not refused
+            first = exact_span(start[0])
+            if first is None: return None
+            if first != total: tr["first_sec"] = first
+            if "OnBootSec" in kv: tr["first_key"] = "OnBootSec"
     elif not cals and not active and len(start) == 1:
         sec = exact_span(start[0])
         if sec is None: return None
