@@ -62,7 +62,8 @@ def next_elapse(tr):
         return "\n".join(res) if res else "Not a valid schedule"
     if tr["type"] == "interval":
         first = tr.get("first_sec")
-        return f"First run {human_span(interval_seconds(tr) if first is None else first)} after login, then repeats"
+        every = interval_seconds(tr)
+        return f"First run {human_span(every if first is None else first)} after login, then every {human_span(every)}"
     sec = int(tr.get("login_sec", 10))
     return "Shortly after you log in" if sec <= 60 else f"{human_span(sec)} after you log in"
 

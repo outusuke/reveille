@@ -1309,9 +1309,11 @@ class RowWording(unittest.TestCase):
 
     def test_preview_text_for_interval_and_login(self):
         self.assertEqual(rv.next_elapse({**rv.DEFAULT_TR, "type": "interval", "every": 90, "unit": "min"}),
-                         "First run 90 min after login, then repeats")
+                         "First run 90 min after login, then every 90 min")
         self.assertEqual(rv.next_elapse({**rv.DEFAULT_TR, "type": "interval", "every": 2, "unit": "d"}),
-                         "First run 2 days after login, then repeats")
+                         "First run 2 days after login, then every 2 days")
+        self.assertEqual(rv.next_elapse({**rv.DEFAULT_TR, "type": "interval", "every": 15, "unit": "min", "first_sec": 120}),
+                         "First run 2 min after login, then every 15 min")
         self.assertEqual(rv.next_elapse({**rv.DEFAULT_TR, "type": "login"}), "Shortly after you log in")
         self.assertEqual(rv.next_elapse({**rv.DEFAULT_TR, "type": "login", "login_sec": 300}), "5 min after you log in")
 

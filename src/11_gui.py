@@ -103,7 +103,8 @@ def gui():
                                          subtitle="If the computer was off at the scheduled time",
                                          active=t.get("catchup", True))
             g.add(self.catchup)
-            self.enabled = Adw.SwitchRow(title="Enabled", active=t.get("enabled", True)); g.add(self.enabled)
+            self.enabled = Adw.SwitchRow(title="Run on schedule", subtitle="Turn off to pause this task without deleting it",
+                                       active=t.get("enabled", True)); g.add(self.enabled)
 
             adv = t.get("adv", {})
             g = Adw.PreferencesGroup(title="Advanced"); page.add(g)
