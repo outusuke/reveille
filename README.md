@@ -4,6 +4,8 @@ GTK4/libadwaita front end for systemd user timers. Create, edit and monitor sche
 
 systemd is the only store. Every task is a plain `.timer` (plus a `.service` for apps and commands) in `~/.config/systemd/user/`, with no database, no JSON file and no special unit prefix. The timers run your command directly and never call reveille, so the units keep working if you delete the program. Last-run results come from systemd itself (`systemctl --user status NAME.service`, `journalctl --user -u NAME.service`).
 
+![reveille window](docs/screenshot.png)
+
 ## Requirements
 
 - Linux with systemd (user session)
