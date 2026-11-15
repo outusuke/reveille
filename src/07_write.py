@@ -8,6 +8,16 @@ def abs_path(path, what):
     if not os.path.isabs(full): raise ValueError(f"{what} must be an absolute path (or start with ~)")
     return ("!" if neg else "") + full
 
+def exec_setting(old_service, adv, key, advkey):
+    """(new line or None, keep) for an Exec*= setting the editor holds as a command in adv[advkey]. A command that
+    is the same as the one already in the file keeps that line exactly as the user wrote it (keep is True, no new
+    line); without the advkey at all the existing lines are not ours to touch."""
+    cmd = (adv.get(advkey) or "").strip()
+    old = [xunesc(joined(g).split("=", 1)[1].strip()) for g in groups(old_service)
+           if joined(g).strip().startswith(f"{key}=")]
+    same = bool(cmd) and old == [cmd]
+    return (f"{key}={exec_words(cmd)}" if cmd and not same else None), same or advkey not in adv
+
 def unit_texts(t, old_service="", old_timer=""):
     """(service text or None, timer text). A task that triggers an existing service has no service of its own.
     The old file texts are merged, so lines the editor doesn't manage (ExecCondition=, comments, ...) survive.
@@ -35,16 +45,16 @@ def unit_texts(t, old_service="", old_timer=""):
         if adv.get("timeout"): svc.append(f"TimeoutStartSec={int(adv['timeout'])}min")
         if retries: svc += ["Restart=on-failure", f"RestartSec={wait}min"]
         if low: svc += ["Nice=19", "IOSchedulingClass=idle"]
-        cond = (adv.get("condition") or "").strip()
-        old_conds = [xunesc(joined(g).split("=", 1)[1].strip()) for g in groups(old_service)
-                     if joined(g).strip().startswith("ExecCondition=")]
-        keep_cond = bool(cond) and old_conds == [cond]        # unchanged: leave the line as the user wrote it
-        if cond and not keep_cond: svc.append(f"ExecCondition={exec_words(cond)}")
+        cond_line, keep_cond = exec_setting(old_service, adv, "ExecCondition", "condition")
+        after_line, keep_after = exec_setting(old_service, adv, "ExecStopPost", "after")
+        if cond_line: svc.append(cond_line)
         if adv.get("online"): svc.append(f"ExecStartPre={WAIT_NET}")
         if t["kind"] == "app": svc.append("KillMode=process")    # the launcher exits at once: don't kill the app it started
         if not keep_exec: svc.append(f"ExecStart={build_exec(t)}")
+        if after_line: svc.append(after_line)
         def keep_svc(k, v):                # a Nice= or IOSchedulingClass= that isn't the low-priority preset stays
-            if k == "ExecCondition": return keep_cond or "condition" not in adv   # no "condition" given: not ours to touch
+            if k == "ExecCondition": return keep_cond
+            if k == "ExecStopPost": return keep_after
             if k == "ExecStartPre": return v != WAIT_NET             # the user's own ExecStartPre= lines stay
             return not low and ((k == "Nice" and v != "19") or (k == "IOSchedulingClass" and v != "idle"))
         def keep_unit(k, v):               # keep dependencies and conditions that aren't ours

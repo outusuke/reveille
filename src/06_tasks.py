@@ -26,6 +26,18 @@ def exec_words(command):
         tokens[0] = found
     return " ".join(xesc(shlex.quote(x)) for x in tokens)
 
+def read_exec_line(sv, key):
+    """(command, why) for an Exec*= setting the editor shows as one command: the value as typed (\"\" if the line is
+    absent), or a reason why it can't be shown (several lines, a special prefix, unbalanced quotes)."""
+    lines = sv.get(key, [])
+    if not lines: return "", ""
+    if len(lines) > 1: return "", f"there are several {key}= lines"
+    cmd = xunesc(lines[0])
+    if not cmd or cmd[0] in "-@:+!|": return "", f"{key}= starts with a special prefix (- @ + ! :)"
+    try: shlex.split(cmd)
+    except ValueError: return "", f"{key}= can't be split into words"
+    return cmd, ""
+
 def parse_service(name):
     """Read the settings the editor manages from a service file. Every other line is left alone when saving.
     Returns {"why": reason} if a managed setting is in a form the editor can't represent."""
@@ -58,13 +70,10 @@ def parse_service(name):
         m = re.fullmatch(r"([1-9]\d*)min", (sv.get("RestartSec") or [""])[-1])
         if not m or int(m[1]) > 1440: return {"why": "RestartSec= isn't a whole number of minutes (1 to 1440)"}
         wait = int(m[1])
-    conds = sv.get("ExecCondition", [])
-    if len(conds) > 1: return {"why": "there are several ExecCondition= lines"}
-    cond = xunesc(conds[0]) if conds else ""
-    if conds and (not cond or cond[0] in "-@:+!|"): return {"why": "ExecCondition= starts with a special prefix (- @ + ! :)"}
-    if conds:
-        try: shlex.split(cond)
-        except ValueError: return {"why": "ExecCondition= can't be split into words"}
+    cond, why = read_exec_line(sv, "ExecCondition")
+    if why: return {"why": why}
+    after, why = read_exec_line(sv, "ExecStopPost")
+    if why: return {"why": why}
     paths = un.get("ConditionPathExists", [])
     if len(paths) > 1: return {"why": "there are several ConditionPathExists= lines"}
     then = [x for v in un.get("OnSuccess", []) for x in v.split()]
@@ -75,7 +84,7 @@ def parse_service(name):
            "timeout": timeout, "ac": "true" in un.get("ConditionACPower", []), "online": ONLINE in deps or WAIT_NET in sv.get("ExecStartPre", []),
            "retries": retries, "retry_wait": wait,
            "low": sv.get("Nice") == ["19"] and sv.get("IOSchedulingClass") == ["idle"],
-           "path": unesc(paths[0]) if paths else "", "condition": cond, "then": then[0] if then else "",
+           "path": unesc(paths[0]) if paths else "", "condition": cond, "after": after, "then": then[0] if then else "",
            "fail": fail[0] if fail else ""}
     s = {"adv": adv, "kind": "command", "command": cmd}
     if len(tokens) == 3 and os.path.basename(tokens[0]) == "gio" and tokens[1] == "launch":

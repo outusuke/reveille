@@ -57,7 +57,7 @@ class RoundTrip(Base):
         self.assertEqual(m["trigger"]["days"], ["Mon", "Fri"])
         self.assertEqual((m["trigger"]["hour"], m["trigger"]["minute"]), (7, 30))
         self.assertEqual(m["adv"], {"cwd": "/tmp", "env": "A=1 'B=x y'", "timeout": 5, "ac": True,
-                                    "online": True, "delay": 60, "wake": False, "retries": 0, "retry_wait": 5, "low": False, "path": "", "condition": "", "then": "", "fail": ""})
+                                    "online": True, "delay": 60, "wake": False, "retries": 0, "retry_wait": 5, "low": False, "path": "", "condition": "", "after": "", "then": "", "fail": ""})
         self.assertIn("echo $HOME | cat", m["command"])
 
     def test_percent_and_dollar_are_escaped_in_the_files(self):
@@ -189,7 +189,7 @@ class Editable(Base):
         write("x.service", svc)
         s2 = rv.parse_service("x.service")
         self.assertEqual(s2["adv"], {"cwd": "/tmp", "env": "A=1", "timeout": 5, "ac": True, "online": True, "retries": 0, "retry_wait": 5, "low": False, "path": "",
-                                   "condition": "/bin/sh -c 'nmcli -g METERED general status | grep -qv \"yes\"'", "then": "", "fail": ""})
+                                   "condition": "/bin/sh -c 'nmcli -g METERED general status | grep -qv \"yes\"'", "after": "", "then": "", "fail": ""})
         svc3, _ = self.save(m, adv={"cwd": "", "env": "", "timeout": 0, "ac": False, "online": False, "delay": 0})
         self.assertEqual(svc3, GPODDER_SERVICE)
 
@@ -1136,6 +1136,47 @@ class Reliability(Base):
         os.makedirs(f"{rv.UNITS}/x.service.d", exist_ok=True)
         write("x.service.d/o.conf", "[Service]\nExecCondition=/usr/bin/false\n")
         m = rv.load_task("x.timer"); self.assertFalse(m["full"]); self.assertIn("ExecCondition=", m["why"])
+
+    def test_after_command_round_trip_and_clearing(self):
+        m, svc = self.roundtrip(after="/usr/bin/touch /tmp/done")
+        self.assertIn("ExecStopPost=/usr/bin/touch /tmp/done\n", svc)
+        self.assertTrue(m["full"]); self.assertEqual(m["adv"]["after"], "/usr/bin/touch /tmp/done")
+        self.assertGreater(svc.index("ExecStopPost="), svc.index("ExecStart="))
+        self.assertNotIn("ExecStopPost", self.roundtrip(after="")[1])
+
+    def test_after_command_and_condition_are_independent(self):
+        m, svc = self.roundtrip(condition="/usr/bin/true", after="/usr/bin/false")
+        self.assertEqual((m["adv"]["condition"], m["adv"]["after"]), ("/usr/bin/true", "/usr/bin/false"))
+        self.assertIn("ExecCondition=/usr/bin/true\n", svc); self.assertIn("ExecStopPost=/usr/bin/false\n", svc)
+
+    def test_after_command_special_characters_and_path_lookup(self):
+        cmd = "/bin/sh -c 'echo $SERVICE_RESULT 100%'"
+        m, svc = self.roundtrip(after=cmd)
+        self.assertIn("$$SERVICE_RESULT", svc); self.assertIn("100%%", svc)
+        self.assertEqual(m["adv"]["after"], cmd)
+        self.assertRegex(self.roundtrip(after="true")[1], r"ExecStopPost=/\S*/true\n")
+        with self.assertRaises(ValueError): rv.unit_texts(task(adv=adv(after="no-such-program-xyz")))
+
+    def test_unchanged_after_command_kept_as_written_and_absent_key_untouched(self):
+        svc = SIMPLE_SERVICE + "ExecStopPost=/bin/sh -c  \"echo bye\"\n"
+        write("x.service", svc); write("x.timer", SIMPLE_TIMER)
+        m = rv.load_task("x.timer"); self.assertTrue(m["full"]); self.assertEqual(m["adv"]["after"], '/bin/sh -c  "echo bye"')
+        base = {"name": "x", "kind": "command", "command": "/usr/bin/true", "trigger": rv.DEFAULT_TR,
+                "service": "x.service", "unit": "x", "old_name": "x", "keep_exec": True}
+        self.assertEqual(rv.unit_texts({**base, "adv": adv(after=m["adv"]["after"])}, svc, SIMPLE_TIMER)[0], svc)
+        self.assertEqual(rv.unit_texts({**base, "adv": adv()}, svc, SIMPLE_TIMER)[0], svc)       # key absent
+        out = rv.unit_texts({**base, "adv": adv(after="/usr/bin/true")}, svc, SIMPLE_TIMER)[0]
+        self.assertEqual(out.count("ExecStopPost="), 1); self.assertNotIn("echo bye", out)
+        self.assertNotIn("ExecStopPost", rv.unit_texts({**base, "adv": adv(after="")}, svc, SIMPLE_TIMER)[0])
+
+    def test_after_command_forms_the_editor_cannot_show_limit_the_task(self):
+        for extra, word in (("ExecStopPost=/usr/bin/true\nExecStopPost=/usr/bin/false\n", "several ExecStopPost"),
+                            ("ExecStopPost=-/usr/bin/true\n", "ExecStopPost= starts with")):
+            write("x.service", SIMPLE_SERVICE + extra); write("x.timer", SIMPLE_TIMER)
+            m = rv.load_task("x.timer"); self.assertFalse(m["full"]); self.assertIn(word, m["why"])
+        write("x.service", SIMPLE_SERVICE); os.makedirs(f"{rv.UNITS}/x.service.d", exist_ok=True)
+        write("x.service.d/o.conf", "[Service]\nExecStopPost=/usr/bin/false\n")
+        m = rv.load_task("x.timer"); self.assertFalse(m["full"]); self.assertIn("ExecStopPost=", m["why"])
 
     def test_then_run_round_trip_and_clearing(self):
         m, svc = self.roundtrip(then="upload.service")

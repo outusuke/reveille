@@ -43,7 +43,7 @@ TIMER_KEYS = set(SCHEDULE_KEYS) | {"AccuracySec"}              # what a save of 
 # Settings the editor manages in the service. A drop-in that sets one of them makes what the editor shows untrue.
 UNIT_KEYS = {"ConditionACPower", "Wants", "After", "ConditionPathExists", "OnSuccess", "OnFailure",
              "StartLimitIntervalSec", "StartLimitBurst"}
-SERVICE_KEYS = {"ExecCondition", "ExecStartPre", "WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice", "IOSchedulingClass"}
+SERVICE_KEYS = {"ExecCondition", "ExecStopPost", "ExecStartPre", "WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice", "IOSchedulingClass"}
 SERVICE_DROPIN_KEYS = {"Unit": UNIT_KEYS, "Service": SERVICE_KEYS | {"ExecStart", "KillMode"}}
 TIMER_DROPIN_KEYS = {"Timer": set(SCHEDULE_KEYS) | {"Unit"}, "Unit": {"Description"}}
 NOTIFY_UNIT = "reveille-notify@%n.service"   # an "If it fails, run" choice: a desktop notification naming the failed unit
@@ -509,6 +509,18 @@ def exec_words(command):
         tokens[0] = found
     return " ".join(xesc(shlex.quote(x)) for x in tokens)
 
+def read_exec_line(sv, key):
+    """(command, why) for an Exec*= setting the editor shows as one command: the value as typed (\"\" if the line is
+    absent), or a reason why it can't be shown (several lines, a special prefix, unbalanced quotes)."""
+    lines = sv.get(key, [])
+    if not lines: return "", ""
+    if len(lines) > 1: return "", f"there are several {key}= lines"
+    cmd = xunesc(lines[0])
+    if not cmd or cmd[0] in "-@:+!|": return "", f"{key}= starts with a special prefix (- @ + ! :)"
+    try: shlex.split(cmd)
+    except ValueError: return "", f"{key}= can't be split into words"
+    return cmd, ""
+
 def parse_service(name):
     """Read the settings the editor manages from a service file. Every other line is left alone when saving.
     Returns {"why": reason} if a managed setting is in a form the editor can't represent."""
@@ -541,13 +553,10 @@ def parse_service(name):
         m = re.fullmatch(r"([1-9]\d*)min", (sv.get("RestartSec") or [""])[-1])
         if not m or int(m[1]) > 1440: return {"why": "RestartSec= isn't a whole number of minutes (1 to 1440)"}
         wait = int(m[1])
-    conds = sv.get("ExecCondition", [])
-    if len(conds) > 1: return {"why": "there are several ExecCondition= lines"}
-    cond = xunesc(conds[0]) if conds else ""
-    if conds and (not cond or cond[0] in "-@:+!|"): return {"why": "ExecCondition= starts with a special prefix (- @ + ! :)"}
-    if conds:
-        try: shlex.split(cond)
-        except ValueError: return {"why": "ExecCondition= can't be split into words"}
+    cond, why = read_exec_line(sv, "ExecCondition")
+    if why: return {"why": why}
+    after, why = read_exec_line(sv, "ExecStopPost")
+    if why: return {"why": why}
     paths = un.get("ConditionPathExists", [])
     if len(paths) > 1: return {"why": "there are several ConditionPathExists= lines"}
     then = [x for v in un.get("OnSuccess", []) for x in v.split()]
@@ -558,7 +567,7 @@ def parse_service(name):
            "timeout": timeout, "ac": "true" in un.get("ConditionACPower", []), "online": ONLINE in deps or WAIT_NET in sv.get("ExecStartPre", []),
            "retries": retries, "retry_wait": wait,
            "low": sv.get("Nice") == ["19"] and sv.get("IOSchedulingClass") == ["idle"],
-           "path": unesc(paths[0]) if paths else "", "condition": cond, "then": then[0] if then else "",
+           "path": unesc(paths[0]) if paths else "", "condition": cond, "after": after, "then": then[0] if then else "",
            "fail": fail[0] if fail else ""}
     s = {"adv": adv, "kind": "command", "command": cmd}
     if len(tokens) == 3 and os.path.basename(tokens[0]) == "gio" and tokens[1] == "launch":
@@ -694,6 +703,16 @@ def abs_path(path, what):
     if not os.path.isabs(full): raise ValueError(f"{what} must be an absolute path (or start with ~)")
     return ("!" if neg else "") + full
 
+def exec_setting(old_service, adv, key, advkey):
+    """(new line or None, keep) for an Exec*= setting the editor holds as a command in adv[advkey]. A command that
+    is the same as the one already in the file keeps that line exactly as the user wrote it (keep is True, no new
+    line); without the advkey at all the existing lines are not ours to touch."""
+    cmd = (adv.get(advkey) or "").strip()
+    old = [xunesc(joined(g).split("=", 1)[1].strip()) for g in groups(old_service)
+           if joined(g).strip().startswith(f"{key}=")]
+    same = bool(cmd) and old == [cmd]
+    return (f"{key}={exec_words(cmd)}" if cmd and not same else None), same or advkey not in adv
+
 def unit_texts(t, old_service="", old_timer=""):
     """(service text or None, timer text). A task that triggers an existing service has no service of its own.
     The old file texts are merged, so lines the editor doesn't manage (ExecCondition=, comments, ...) survive.
@@ -721,16 +740,16 @@ def unit_texts(t, old_service="", old_timer=""):
         if adv.get("timeout"): svc.append(f"TimeoutStartSec={int(adv['timeout'])}min")
         if retries: svc += ["Restart=on-failure", f"RestartSec={wait}min"]
         if low: svc += ["Nice=19", "IOSchedulingClass=idle"]
-        cond = (adv.get("condition") or "").strip()
-        old_conds = [xunesc(joined(g).split("=", 1)[1].strip()) for g in groups(old_service)
-                     if joined(g).strip().startswith("ExecCondition=")]
-        keep_cond = bool(cond) and old_conds == [cond]        # unchanged: leave the line as the user wrote it
-        if cond and not keep_cond: svc.append(f"ExecCondition={exec_words(cond)}")
+        cond_line, keep_cond = exec_setting(old_service, adv, "ExecCondition", "condition")
+        after_line, keep_after = exec_setting(old_service, adv, "ExecStopPost", "after")
+        if cond_line: svc.append(cond_line)
         if adv.get("online"): svc.append(f"ExecStartPre={WAIT_NET}")
         if t["kind"] == "app": svc.append("KillMode=process")    # the launcher exits at once: don't kill the app it started
         if not keep_exec: svc.append(f"ExecStart={build_exec(t)}")
+        if after_line: svc.append(after_line)
         def keep_svc(k, v):                # a Nice= or IOSchedulingClass= that isn't the low-priority preset stays
-            if k == "ExecCondition": return keep_cond or "condition" not in adv   # no "condition" given: not ours to touch
+            if k == "ExecCondition": return keep_cond
+            if k == "ExecStopPost": return keep_after
             if k == "ExecStartPre": return v != WAIT_NET             # the user's own ExecStartPre= lines stay
             return not low and ((k == "Nice" and v != "19") or (k == "IOSchedulingClass" and v != "idle"))
         def keep_unit(k, v):               # keep dependencies and conditions that aren't ours
@@ -1412,6 +1431,8 @@ def gui():
             if sd is not None and sd < 243:
                 self.cond.set_sensitive(False)
                 self.cond.set_title(f"Only if this command succeeds (needs systemd 243 or newer, this is {sd})")
+            self.after = Adw.EntryRow(title="After it finishes, run this command (also after a failure)",
+                                      text=adv.get("after", ""))
             others = [x for x in found if x != (m or {}).get("service")]
             def picker(title, subtitle, cur, extra=()):    # "None" plus the services; a current value that isn't listed stays
                 items, sel = pick_list(list(extra) + others, cur)
@@ -1430,7 +1451,7 @@ def gui():
             if sd is not None and sd < 249:
                 self.then.set_sensitive(False); self.then.set_subtitle(f"Needs systemd 249 or newer (this is {sd})")
             self.own_only = [self.cwd, self.env, self.timeout, self.ac, self.online, self.retries, self.retry_wait,
-                             self.low, self.path, self.cond, self.then, self.fail]   # don't apply to an existing service
+                             self.low, self.path, self.cond, self.after, self.then, self.fail]   # don't apply to an existing service
             for r in self.own_only + [self.delay, self.wake]: g.add(r)
 
             # Delete lives inside the item: a task's timer, or a service without a timer opened via its row
@@ -1532,7 +1553,7 @@ def gui():
                          "wake": self.wake.get_active(),
                          "retries": int(self.retries.get_value()), "retry_wait": int(self.retry_wait.get_value()),
                          "low": self.low.get_active(), "path": self.path.get_text().strip(),
-                         "condition": self.cond.get_text().strip(),
+                         "condition": self.cond.get_text().strip(), "after": self.after.get_text().strip(),
                          "then": self.then_opts[self.then.get_selected()],
                          "fail": self.fail_opts[self.fail.get_selected()]}}
             if k == 0:
@@ -2127,7 +2148,7 @@ def cmd_new(a):
     if not err and cal and bad_calendar(cal): err = f"systemd rejected the schedule {cal!r}"
     if err: print(err, file=sys.stderr); return 1
     t = {"name": a.name, "kind": "command", "command": a.command, "trigger": {**DEFAULT_TR, **tr}, "catchup": True,
-         "enabled": not a.disabled, "adv": {"wake": a.wake, "condition": a.only_if or ""}}
+         "enabled": not a.disabled, "adv": {"wake": a.wake, "condition": a.only_if or "", "after": a.after or ""}}
     try:
         t["unit"] = unique_base(a.name)
         if a.dry_run:                                   # show exactly what would be written, write nothing
@@ -2202,6 +2223,7 @@ def build_parser():
     when.add_argument("--login", action="store_true", help="shortly after login")
     nw.add_argument("--days", metavar="DAYS", help="with --at: only these days (Mon,Wed or Mon..Fri)")
     nw.add_argument("--only-if", metavar="CMD", help="run only if this command succeeds (ExecCondition=); exit 1 to 254 skips the run quietly")
+    nw.add_argument("--after", metavar="CMD", help="run this command when the task has finished, whether it succeeded or failed (ExecStopPost=)")
     nw.add_argument("--disabled", action="store_true", help="create the timer switched off")
     nw.add_argument("--wake", action="store_true", help="wake the computer from suspend when the timer is due (WakeSystem=true)")
     nw.add_argument("--dry-run", action="store_true", help="print the unit files that would be written and change nothing")
