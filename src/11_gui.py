@@ -118,6 +118,10 @@ def gui():
             self.delay.set_title("Random delay (seconds)"); self.delay.set_subtitle("Spreads runs out so many tasks don't start at once")
             self.delay.set_value(adv.get("delay", 0))
             sd = win.sdver                                  # systemd's version, to grey out what it can't do
+            self.wake = Adw.SwitchRow(title="Wake the computer from sleep", active=adv.get("wake", False),
+                                      subtitle="Resume from suspend at the scheduled time (needs hardware support)")
+            if sd is not None and sd < 254:                 # older user managers lack CAP_WAKE_ALARM, so the timer would fail
+                self.wake.set_sensitive(False); self.wake.set_subtitle(f"Needs systemd 254 or newer (this is {sd})")
             self.retries = Adw.SpinRow.new_with_range(0, 10, 1); self.retries.set_title("Retry on failure")
             self.retries.set_subtitle("How many times to try again; 0 means never"); self.retries.set_value(adv.get("retries", 0))
             self.retry_wait = Adw.SpinRow.new_with_range(1, 1440, 1); self.retry_wait.set_title("Wait between tries (minutes)")
@@ -145,7 +149,7 @@ def gui():
                 self.then.set_sensitive(False); self.then.set_subtitle(f"Needs systemd 249 or newer (this is {sd})")
             self.own_only = [self.cwd, self.env, self.timeout, self.ac, self.online, self.retries, self.retry_wait,
                              self.low, self.path, self.then, self.fail]   # don't apply to an existing service
-            for r in self.own_only + [self.delay]: g.add(r)
+            for r in self.own_only + [self.delay, self.wake]: g.add(r)
 
             # Delete lives inside the item: a task's timer, or a service without a timer opened via its row
             self.target = m["timer"] if m else (preset if preset and delete_plan(preset) else None)
@@ -230,7 +234,8 @@ def gui():
             if tr["type"] == "times" and not tr["times"]: return self.win.toast("Enter times like 08:00, 12:30")
             if not self.full:
                 timer, catchup, delay = self.m["timer"], self.catchup.get_active(), int(self.delay.get_value())
-                return self.run_save("sched", tr, lambda: rewrite_timer(timer, tr, catchup, delay))
+                wake = self.wake.get_active()
+                return self.run_save("sched", tr, lambda: rewrite_timer(timer, tr, catchup, delay, wake))
             k = self.kind.get_selected()
             if not name: return self.win.toast("Give the task a name")
             try:
@@ -242,6 +247,7 @@ def gui():
                  "adv": {"cwd": self.cwd.get_text().strip(), "env": self.env.get_text().strip(),
                          "timeout": int(self.timeout.get_value()), "ac": self.ac.get_active(),
                          "online": self.online.get_active(), "delay": int(self.delay.get_value()),
+                         "wake": self.wake.get_active(),
                          "retries": int(self.retries.get_value()), "retry_wait": int(self.retry_wait.get_value()),
                          "low": self.low.get_active(), "path": self.path.get_text().strip(),
                          "then": self.then_opts[self.then.get_selected()],

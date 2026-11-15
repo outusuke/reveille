@@ -122,7 +122,7 @@ def load_task(timer, status=None):
     desc = unesc((u.get("Unit", {}).get("Description") or [""])[0])
     m = {"timer": timer, "unit": base, "service": target, "name": desc or base, "kind": "service", "full": False,
          "trigger": sched[0] if sched else None, "catchup": sched[1] if sched else True,
-         "adv": {"delay": sched[2] if sched else 0}, "dropins": files,
+         "adv": {"delay": sched[2] if sched else 0, "wake": sched[3] if sched else False}, "dropins": files,
          # "enabled" means the timer is active (will fire); "fstate" says whether it also survives a restart
          "enabled": (status[timer].get("ActiveState") == "active" if status is not None and timer in status
                      else unit_status(timer)[1]),
@@ -135,7 +135,7 @@ def load_task(timer, status=None):
         s = parse_service(target)
         if swhy or "why" in s: m["why"] = swhy or s["why"]; return m
         m.update(kind=s["kind"], app=s.get("app", ""), command=s.get("command", ""),
-                 adv={**s["adv"], "delay": sched[2]})
+                 adv={**s["adv"], "delay": sched[2], "wake": sched[3]})
     m["full"] = True
     return m
 

@@ -87,7 +87,7 @@ def cmd_new(a):
     if not err and cal and bad_calendar(cal): err = f"systemd rejected the schedule {cal!r}"
     if err: print(err, file=sys.stderr); return 1
     t = {"name": a.name, "kind": "command", "command": a.command, "trigger": {**DEFAULT_TR, **tr}, "catchup": True,
-         "enabled": not a.disabled, "adv": {}}
+         "enabled": not a.disabled, "adv": {"wake": a.wake}}
     try:
         t["unit"] = unique_base(a.name)
         if a.dry_run:                                   # show exactly what would be written, write nothing
@@ -162,6 +162,7 @@ def build_parser():
     when.add_argument("--login", action="store_true", help="shortly after login")
     nw.add_argument("--days", metavar="DAYS", help="with --at: only these days (Mon,Wed or Mon..Fri)")
     nw.add_argument("--disabled", action="store_true", help="create the timer switched off")
+    nw.add_argument("--wake", action="store_true", help="wake the computer from suspend when the timer is due (WakeSystem=true)")
     nw.add_argument("--dry-run", action="store_true", help="print the unit files that would be written and change nothing")
     c = sub.add_parser("import-cron", help="turn crontab entries into tasks (preview unless --apply)")
     c.add_argument("--file", metavar="FILE", help="read this crontab file instead of 'crontab -l' (- for standard input)")

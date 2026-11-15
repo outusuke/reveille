@@ -72,8 +72,9 @@ def needs_precision(secs):
     that isn't a whole number of minutes would be off by a large share of its length."""
     return secs < 60 or secs % 60 != 0
 
-def timer_lines(tr, catchup, delay):
-    """The schedule lines of a timer. Raises ValueError if the schedule is empty, so nothing is half-written."""
+def timer_lines(tr, catchup, delay, wake=False):
+    """The schedule lines of a timer. Raises ValueError if the schedule is empty, so nothing is half-written.
+    `wake` asks systemd to resume the computer from suspend when the timer elapses (WakeSystem=true)."""
     out, cal = [], on_calendar(tr)
     if tr["type"] in CALENDAR_TYPES:
         if not cal: raise ValueError("The schedule is empty")
@@ -90,6 +91,7 @@ def timer_lines(tr, catchup, delay):
     else:
         out.append(f"OnStartupSec={fmt_span(int(tr.get('login_sec', 10)))}")
     if delay: out.append(f"RandomizedDelaySec={int(delay)}")
+    if wake: out.append("WakeSystem=true")
     return out
 
 def timer_keep(tr):
@@ -144,9 +146,10 @@ def from_calendar(expr):
     return {"type": "custom", "expr": e}
 
 def parse_schedule(kv):
-    """Read the [Timer] keys as (trigger, catchup, delay), or None if they use something the editor would lose."""
+    """Read the [Timer] keys as (trigger, catchup, delay, wake), or None if they use something the editor would lose."""
     if any(k in kv for k in ("OnActiveSec", "OnUnitInactiveSec")): return None
     catchup = kv.get("Persistent", ["false"])[-1].lower() in ("true", "yes", "1", "on")
+    wake = kv.get("WakeSystem", ["false"])[-1].lower() in ("true", "yes", "1", "on")
     delay = 0
     if "RandomizedDelaySec" in kv:
         delay = parse_span(kv["RandomizedDelaySec"][-1])
@@ -181,12 +184,12 @@ def parse_schedule(kv):
         tr = {"type": "login", "login_sec": sec}
     else:
         return None
-    return {**DEFAULT_TR, **tr}, catchup, delay
+    return {**DEFAULT_TR, **tr}, catchup, delay, wake
 
-def rewrite_timer(unit, tr, catchup, delay):
+def rewrite_timer(unit, tr, catchup, delay, wake=False):
     """Replace only the schedule lines of a hand-written timer; everything else in the file is kept."""
     path = unit_path(unit)
-    lines = timer_lines(tr, catchup, delay)             # before anything is written: it can refuse
+    lines = timer_lines(tr, catchup, delay, wake)             # before anything is written: it can refuse
     try:
         with open(path) as f: text = f.read()
         if not os.path.exists(path + ".reveille-bak"):          # one-time backup of the original

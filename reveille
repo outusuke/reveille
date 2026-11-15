@@ -38,7 +38,7 @@ DEFAULT_TR = {"type": "daily", "hour": 3, "minute": 0, "days": ["Mon"], "dom": 1
               "first_sec": None, "first_key": None}   # interval only: first run if it differs from the interval; its key
 
 SCHEDULE_KEYS = ("OnCalendar", "OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnActiveSec", "OnUnitInactiveSec",
-                 "Persistent", "RandomizedDelaySec")
+                 "Persistent", "RandomizedDelaySec", "WakeSystem")
 TIMER_KEYS = set(SCHEDULE_KEYS) | {"AccuracySec"}              # what a save of the schedule may rewrite
 # Settings the editor manages in the service. A drop-in that sets one of them makes what the editor shows untrue.
 UNIT_KEYS = {"ConditionACPower", "Wants", "After", "ConditionPathExists", "OnSuccess", "OnFailure",
@@ -352,8 +352,9 @@ def needs_precision(secs):
     that isn't a whole number of minutes would be off by a large share of its length."""
     return secs < 60 or secs % 60 != 0
 
-def timer_lines(tr, catchup, delay):
-    """The schedule lines of a timer. Raises ValueError if the schedule is empty, so nothing is half-written."""
+def timer_lines(tr, catchup, delay, wake=False):
+    """The schedule lines of a timer. Raises ValueError if the schedule is empty, so nothing is half-written.
+    `wake` asks systemd to resume the computer from suspend when the timer elapses (WakeSystem=true)."""
     out, cal = [], on_calendar(tr)
     if tr["type"] in CALENDAR_TYPES:
         if not cal: raise ValueError("The schedule is empty")
@@ -370,6 +371,7 @@ def timer_lines(tr, catchup, delay):
     else:
         out.append(f"OnStartupSec={fmt_span(int(tr.get('login_sec', 10)))}")
     if delay: out.append(f"RandomizedDelaySec={int(delay)}")
+    if wake: out.append("WakeSystem=true")
     return out
 
 def timer_keep(tr):
@@ -424,9 +426,10 @@ def from_calendar(expr):
     return {"type": "custom", "expr": e}
 
 def parse_schedule(kv):
-    """Read the [Timer] keys as (trigger, catchup, delay), or None if they use something the editor would lose."""
+    """Read the [Timer] keys as (trigger, catchup, delay, wake), or None if they use something the editor would lose."""
     if any(k in kv for k in ("OnActiveSec", "OnUnitInactiveSec")): return None
     catchup = kv.get("Persistent", ["false"])[-1].lower() in ("true", "yes", "1", "on")
+    wake = kv.get("WakeSystem", ["false"])[-1].lower() in ("true", "yes", "1", "on")
     delay = 0
     if "RandomizedDelaySec" in kv:
         delay = parse_span(kv["RandomizedDelaySec"][-1])
@@ -461,12 +464,12 @@ def parse_schedule(kv):
         tr = {"type": "login", "login_sec": sec}
     else:
         return None
-    return {**DEFAULT_TR, **tr}, catchup, delay
+    return {**DEFAULT_TR, **tr}, catchup, delay, wake
 
-def rewrite_timer(unit, tr, catchup, delay):
+def rewrite_timer(unit, tr, catchup, delay, wake=False):
     """Replace only the schedule lines of a hand-written timer; everything else in the file is kept."""
     path = unit_path(unit)
-    lines = timer_lines(tr, catchup, delay)             # before anything is written: it can refuse
+    lines = timer_lines(tr, catchup, delay, wake)             # before anything is written: it can refuse
     try:
         with open(path) as f: text = f.read()
         if not os.path.exists(path + ".reveille-bak"):          # one-time backup of the original
@@ -602,7 +605,7 @@ def load_task(timer, status=None):
     desc = unesc((u.get("Unit", {}).get("Description") or [""])[0])
     m = {"timer": timer, "unit": base, "service": target, "name": desc or base, "kind": "service", "full": False,
          "trigger": sched[0] if sched else None, "catchup": sched[1] if sched else True,
-         "adv": {"delay": sched[2] if sched else 0}, "dropins": files,
+         "adv": {"delay": sched[2] if sched else 0, "wake": sched[3] if sched else False}, "dropins": files,
          # "enabled" means the timer is active (will fire); "fstate" says whether it also survives a restart
          "enabled": (status[timer].get("ActiveState") == "active" if status is not None and timer in status
                      else unit_status(timer)[1]),
@@ -615,7 +618,7 @@ def load_task(timer, status=None):
         s = parse_service(target)
         if swhy or "why" in s: m["why"] = swhy or s["why"]; return m
         m.update(kind=s["kind"], app=s.get("app", ""), command=s.get("command", ""),
-                 adv={**s["adv"], "delay": sched[2]})
+                 adv={**s["adv"], "delay": sched[2], "wake": sched[3]})
     m["full"] = True
     return m
 
@@ -725,7 +728,7 @@ def unit_texts(t, old_service="", old_timer=""):
         "Unit": ({"Description"} if desc else set(), [f"Description={esc(name)}"] if desc else [], never),
         "Timer": (TIMER_KEYS | {"Unit"},
                   ([f"Unit={t['service']}"] if t["kind"] == "service" else [])
-                  + timer_lines(tr, t.get("catchup", True), adv.get("delay", 0)), timer_keep(tr)),
+                  + timer_lines(tr, t.get("catchup", True), adv.get("delay", 0), adv.get("wake", False)), timer_keep(tr)),
         "Install": ({"WantedBy"}, ["WantedBy=timers.target"], lambda k, v: v != "timers.target")})
     return service, timer
 
@@ -1346,6 +1349,10 @@ def gui():
             self.delay.set_title("Random delay (seconds)"); self.delay.set_subtitle("Spreads runs out so many tasks don't start at once")
             self.delay.set_value(adv.get("delay", 0))
             sd = win.sdver                                  # systemd's version, to grey out what it can't do
+            self.wake = Adw.SwitchRow(title="Wake the computer from sleep", active=adv.get("wake", False),
+                                      subtitle="Resume from suspend at the scheduled time (needs hardware support)")
+            if sd is not None and sd < 254:                 # older user managers lack CAP_WAKE_ALARM, so the timer would fail
+                self.wake.set_sensitive(False); self.wake.set_subtitle(f"Needs systemd 254 or newer (this is {sd})")
             self.retries = Adw.SpinRow.new_with_range(0, 10, 1); self.retries.set_title("Retry on failure")
             self.retries.set_subtitle("How many times to try again; 0 means never"); self.retries.set_value(adv.get("retries", 0))
             self.retry_wait = Adw.SpinRow.new_with_range(1, 1440, 1); self.retry_wait.set_title("Wait between tries (minutes)")
@@ -1373,7 +1380,7 @@ def gui():
                 self.then.set_sensitive(False); self.then.set_subtitle(f"Needs systemd 249 or newer (this is {sd})")
             self.own_only = [self.cwd, self.env, self.timeout, self.ac, self.online, self.retries, self.retry_wait,
                              self.low, self.path, self.then, self.fail]   # don't apply to an existing service
-            for r in self.own_only + [self.delay]: g.add(r)
+            for r in self.own_only + [self.delay, self.wake]: g.add(r)
 
             # Delete lives inside the item: a task's timer, or a service without a timer opened via its row
             self.target = m["timer"] if m else (preset if preset and delete_plan(preset) else None)
@@ -1458,7 +1465,8 @@ def gui():
             if tr["type"] == "times" and not tr["times"]: return self.win.toast("Enter times like 08:00, 12:30")
             if not self.full:
                 timer, catchup, delay = self.m["timer"], self.catchup.get_active(), int(self.delay.get_value())
-                return self.run_save("sched", tr, lambda: rewrite_timer(timer, tr, catchup, delay))
+                wake = self.wake.get_active()
+                return self.run_save("sched", tr, lambda: rewrite_timer(timer, tr, catchup, delay, wake))
             k = self.kind.get_selected()
             if not name: return self.win.toast("Give the task a name")
             try:
@@ -1470,6 +1478,7 @@ def gui():
                  "adv": {"cwd": self.cwd.get_text().strip(), "env": self.env.get_text().strip(),
                          "timeout": int(self.timeout.get_value()), "ac": self.ac.get_active(),
                          "online": self.online.get_active(), "delay": int(self.delay.get_value()),
+                         "wake": self.wake.get_active(),
                          "retries": int(self.retries.get_value()), "retry_wait": int(self.retry_wait.get_value()),
                          "low": self.low.get_active(), "path": self.path.get_text().strip(),
                          "then": self.then_opts[self.then.get_selected()],
@@ -2066,7 +2075,7 @@ def cmd_new(a):
     if not err and cal and bad_calendar(cal): err = f"systemd rejected the schedule {cal!r}"
     if err: print(err, file=sys.stderr); return 1
     t = {"name": a.name, "kind": "command", "command": a.command, "trigger": {**DEFAULT_TR, **tr}, "catchup": True,
-         "enabled": not a.disabled, "adv": {}}
+         "enabled": not a.disabled, "adv": {"wake": a.wake}}
     try:
         t["unit"] = unique_base(a.name)
         if a.dry_run:                                   # show exactly what would be written, write nothing
@@ -2141,6 +2150,7 @@ def build_parser():
     when.add_argument("--login", action="store_true", help="shortly after login")
     nw.add_argument("--days", metavar="DAYS", help="with --at: only these days (Mon,Wed or Mon..Fri)")
     nw.add_argument("--disabled", action="store_true", help="create the timer switched off")
+    nw.add_argument("--wake", action="store_true", help="wake the computer from suspend when the timer is due (WakeSystem=true)")
     nw.add_argument("--dry-run", action="store_true", help="print the unit files that would be written and change nothing")
     c = sub.add_parser("import-cron", help="turn crontab entries into tasks (preview unless --apply)")
     c.add_argument("--file", metavar="FILE", help="read this crontab file instead of 'crontab -l' (- for standard input)")

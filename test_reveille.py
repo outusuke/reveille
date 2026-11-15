@@ -57,7 +57,7 @@ class RoundTrip(Base):
         self.assertEqual(m["trigger"]["days"], ["Mon", "Fri"])
         self.assertEqual((m["trigger"]["hour"], m["trigger"]["minute"]), (7, 30))
         self.assertEqual(m["adv"], {"cwd": "/tmp", "env": "A=1 'B=x y'", "timeout": 5, "ac": True,
-                                    "online": True, "delay": 60, "retries": 0, "retry_wait": 5, "low": False, "path": "", "then": "", "fail": ""})
+                                    "online": True, "delay": 60, "wake": False, "retries": 0, "retry_wait": 5, "low": False, "path": "", "then": "", "fail": ""})
         self.assertIn("echo $HOME | cat", m["command"])
 
     def test_percent_and_dollar_are_escaped_in_the_files(self):
@@ -260,7 +260,7 @@ class Schedules(unittest.TestCase):
         return rv.parse_schedule({k: v if isinstance(v, list) else [v] for k, v in kv.items()})
 
     def test_daily(self):
-        tr, catchup, delay = self.parse(OnCalendar="*-*-* 07:10:00", Persistent="true")
+        tr, catchup, delay, wake = self.parse(OnCalendar="*-*-* 07:10:00", Persistent="true")
         self.assertEqual((tr["type"], tr["hour"], tr["minute"], catchup, delay), ("daily", 7, 10, True, 0))
 
     def test_weekly_and_monthly(self):
@@ -288,7 +288,7 @@ class Schedules(unittest.TestCase):
             lines = rv.timer_lines(tr, True, 30)
             kv = {}
             for l in lines: k, v = l.split("=", 1); kv.setdefault(k, []).append(v)
-            back, catchup, delay = rv.parse_schedule(kv)
+            back, catchup, delay, wake = rv.parse_schedule(kv)
             self.assertEqual(back["type"], tr["type"]); self.assertEqual(delay, 30)
 
 
@@ -819,6 +819,12 @@ class CommandLine(Base):
         code, _, err = self.run_main("new", "X", "--command", "no-such-cmd-xyz", "--at", "09:00", "--dry-run")
         self.assertEqual(code, 1); self.assertIn("not found", err)
 
+    def test_new_command_flag(self):
+        code, out, _ = self.run_main("new", "Alarm", "--command", "true", "--at", "06:30", "--wake", "--dry-run")
+        self.assertEqual(code, 0); self.assertIn("WakeSystem=true", out)
+        code, out, _ = self.run_main("new", "Alarm", "--command", "true", "--at", "06:30", "--dry-run")
+        self.assertNotIn("WakeSystem", out)
+
     def test_new_task_disabled_and_errors(self):
         code, out, _ = self.new("--at", "09:00", "--disabled")
         self.assertEqual(code, 0); self.assertIn("switched off", out); self.assertIn(("disable", "--now", "nightly.timer"), CALLS)
@@ -1251,6 +1257,57 @@ class CatchUp(Base):
     def test_every_trigger_the_editor_offers_is_known(self):
         self.assertEqual(len(rv.TRIGGERS), len(rv.TRIGGER_IDS))
         self.assertEqual(set(rv.TRIGGER_IDS) - {"interval", "login"}, rv.CALENDAR_TYPES)
+
+
+class WakeSystem(Editable):
+    """"Wake the computer from sleep" is WakeSystem=true in [Timer], for every kind of schedule and task."""
+    def test_off_writes_nothing_on_writes_the_line(self):
+        for tp in ("daily", "interval", "login", "custom"):
+            tr = {**rv.DEFAULT_TR, "type": tp, "expr": "Mon 09:00"}
+            self.assertFalse([l for l in rv.timer_lines(tr, True, 0) if l.startswith("WakeSystem")], tp)
+            self.assertIn("WakeSystem=true", rv.timer_lines(tr, True, 0, True), tp)
+
+    def test_parse_reads_every_spelling_of_true(self):
+        parse = lambda *v: rv.parse_schedule({"OnCalendar": ["daily"], **({"WakeSystem": list(v)} if v else {})})[3]
+        self.assertFalse(parse())
+        for yes in ("true", "yes", "1", "on", "True"): self.assertTrue(parse(yes), yes)
+        for no in ("false", "no", "0"): self.assertFalse(parse(no), no)
+        self.assertTrue(parse("false", "true"))                         # the last assignment wins, as in systemd
+
+    def test_roundtrip_through_apply_and_load(self):
+        t = task(name="Alarm", adv={"wake": True})
+        self.assertIsNone(rv.apply_task(t))
+        self.assertIn("WakeSystem=true", rv.read_text(f"{rv.UNITS}/alarm.timer"))
+        self.assertTrue(rv.load_task("alarm.timer")["adv"]["wake"])
+        t = task(name="Alarm", adv={"wake": False}, unit="alarm")
+        self.assertIsNone(rv.apply_task(t))
+        self.assertNotIn("WakeSystem", rv.read_text(f"{rv.UNITS}/alarm.timer"))
+        self.assertFalse(rv.load_task("alarm.timer")["adv"]["wake"])
+
+    def test_a_hand_written_line_is_kept_when_the_task_is_saved_unchanged(self):
+        tim = SIMPLE_TIMER.replace("[Install]", "WakeSystem=yes\n\n[Install]")
+        m = self.load(SIMPLE_SERVICE, tim)
+        self.assertTrue(m["full"]); self.assertTrue(m["adv"]["wake"])
+        _, out = self.save(m)
+        self.assertIn("WakeSystem=true", out); self.assertNotIn("WakeSystem=yes", out)
+        _, out = self.save(m, adv={**m["adv"], "wake": False})
+        self.assertNotIn("WakeSystem", out)
+
+    def test_schedule_only_rewrite_keeps_or_changes_it(self):
+        tim = "[Timer]\nOnCalendar=Mon *-*-* 03:00:00\nWakeSystem=true\n[Install]\nWantedBy=timers.target\n"
+        write("x.timer", tim)
+        self.assertTrue(rv.load_task("x.timer")["adv"]["wake"])
+        self.assertIsNone(rv.rewrite_timer("x.timer", {**rv.DEFAULT_TR, "hour": 5}, True, 0, True))
+        out = rv.read_text(f"{rv.UNITS}/x.timer")
+        self.assertIn("OnCalendar=*-*-* 05:00:00", out); self.assertEqual(out.count("WakeSystem=true"), 1)
+        self.assertIsNone(rv.rewrite_timer("x.timer", {**rv.DEFAULT_TR, "hour": 5}, True, 0, False))
+        self.assertNotIn("WakeSystem", rv.read_text(f"{rv.UNITS}/x.timer"))
+
+    def test_a_timer_drop_in_that_sets_it_limits_the_task(self):
+        write("x.service", SIMPLE_SERVICE); write("x.timer", SIMPLE_TIMER)
+        os.makedirs(f"{rv.UNITS}/x.timer.d", exist_ok=True); write("x.timer.d/o.conf", "[Timer]\nWakeSystem=true\n")
+        m = rv.load_task("x.timer")
+        self.assertIn("WakeSystem=", m["why"])
 
 
 class DropIns(Editable):

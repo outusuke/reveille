@@ -54,7 +54,7 @@ def unit_texts(t, old_service="", old_timer=""):
         "Unit": ({"Description"} if desc else set(), [f"Description={esc(name)}"] if desc else [], never),
         "Timer": (TIMER_KEYS | {"Unit"},
                   ([f"Unit={t['service']}"] if t["kind"] == "service" else [])
-                  + timer_lines(tr, t.get("catchup", True), adv.get("delay", 0)), timer_keep(tr)),
+                  + timer_lines(tr, t.get("catchup", True), adv.get("delay", 0), adv.get("wake", False)), timer_keep(tr)),
         "Install": ({"WantedBy"}, ["WantedBy=timers.target"], lambda k, v: v != "timers.target")})
     return service, timer
 

@@ -22,7 +22,7 @@ DEFAULT_TR = {"type": "daily", "hour": 3, "minute": 0, "days": ["Mon"], "dom": 1
               "first_sec": None, "first_key": None}   # interval only: first run if it differs from the interval; its key
 
 SCHEDULE_KEYS = ("OnCalendar", "OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnActiveSec", "OnUnitInactiveSec",
-                 "Persistent", "RandomizedDelaySec")
+                 "Persistent", "RandomizedDelaySec", "WakeSystem")
 TIMER_KEYS = set(SCHEDULE_KEYS) | {"AccuracySec"}              # what a save of the schedule may rewrite
 # Settings the editor manages in the service. A drop-in that sets one of them makes what the editor shows untrue.
 UNIT_KEYS = {"ConditionACPower", "Wants", "After", "ConditionPathExists", "OnSuccess", "OnFailure",
