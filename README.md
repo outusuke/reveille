@@ -20,6 +20,7 @@ systemd is the only store. Every task is a plain `.timer` (plus a `.service` for
     ./reveille uninstall    remove from the app menu
     ./reveille services     list services the picker finds
     ./reveille list         print every task with its schedule, next run and last result
+    ./reveille list --json  the same as JSON, for scripts
     ./reveille run NAME     run a task or service now (task name or unit name)
     ./reveille import-cron  preview turning your crontab into tasks (add --apply to create them)
     ./reveille --version    print the version (--help lists all commands)

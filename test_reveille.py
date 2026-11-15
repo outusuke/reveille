@@ -758,6 +758,18 @@ class CommandLine(Base):
             else: sys.modules["gi"] = old
         self.assertEqual(code, 1); self.assertIn("PyGObject", err); self.assertIn("--help", err)
 
+    def test_list_json(self):
+        import json
+        rv.gather = lambda: {"tasks": [], "free": []}
+        self.assertEqual(json.loads(self.run_main("list", "--json")[1]), [])
+        m = {"unit": "nightly", "name": "Nightly", "trigger": {**rv.DEFAULT_TR}, "enabled": True, "next": "Sun 03:00",
+             "last": {"time": "Sat 03:00", "rc": 1}, "running": False}
+        rv.gather = lambda: {"tasks": [m], "free": []}
+        code, out, _ = self.run_main("list", "--json")
+        row = json.loads(out)[0]
+        self.assertEqual(code, 0)
+        self.assertEqual((row["unit"], row["schedule"], row["last"]["rc"], row["retrying"]), ("nightly", "Every day at 03:00", 1, False))
+
     def test_list_prints_tasks_or_says_there_are_none(self):
         rv.gather = lambda: {"tasks": [], "free": []}
         self.assertEqual(self.run_main("list")[:2], (0, "No tasks\n"))

@@ -14,5 +14,5 @@ in ~/.config/systemd/user. Nothing else is kept on disk, and the timers never ca
   reveille import-cron  turn crontab entries into tasks (preview; --apply creates them)
   reveille --version
 """
-import argparse, datetime, os, re, shlex, shutil, subprocess, sys, tempfile, threading, time
+import argparse, datetime, json, os, re, shlex, shutil, subprocess, sys, tempfile, threading, time
 

@@ -8,9 +8,14 @@ def cmd_services():
     r = list_services(); print(f"\n{len(r)} services found:"); print("\n".join(r))
     return 0
 
-def cmd_list():
-    """Print every task with its schedule, next run and last result."""
+def cmd_list(as_json=False):
+    """Print every task with its schedule, next run and last result (as JSON for scripts)."""
     tasks = gather()["tasks"]
+    if as_json:
+        print(json.dumps([{"unit": m["unit"], "name": m["name"], "schedule": describe(m["trigger"]) if m["trigger"] else None,
+                           "enabled": m["enabled"], "running": m["running"], "retrying": m.get("retrying", False),
+                           "next": m["next"] or None, "last": m["last"]} for m in tasks], indent=2))
+        return 0
     if not tasks: print("No tasks"); return 0
     for m in tasks:
         sub, _ = task_texts(m)
@@ -78,7 +83,8 @@ def build_parser():
     sub.add_parser("install", help="add reveille to the app menu")
     sub.add_parser("uninstall", help="remove reveille from the app menu")
     sub.add_parser("services", help="list the services the picker finds (troubleshooting)")
-    sub.add_parser("list", help="print every task with its schedule, next run and last result")
+    ls = sub.add_parser("list", help="print every task with its schedule, next run and last result")
+    ls.add_argument("--json", action="store_true", help="print machine-readable JSON instead")
     r = sub.add_parser("run", help="run a task or service now")
     r.add_argument("name", help="task name or unit name, as shown by 'list'")
     c = sub.add_parser("import-cron", help="turn crontab entries into tasks (preview unless --apply)")
@@ -90,7 +96,7 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     if args.cmd == "services": return cmd_services()
-    if args.cmd == "list": return cmd_list()
+    if args.cmd == "list": return cmd_list(args.json)
     if args.cmd == "run": return cmd_run(args.name)
     if args.cmd == "import-cron": return cmd_import_cron(args.file, args.apply, args.disabled)
     if args.cmd in ("install", "uninstall"): return cmd_menu(args.cmd == "install")
