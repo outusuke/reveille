@@ -902,6 +902,29 @@ def systemd_version():
         _CACHE["v"] = int(m[1]) if m else None
     return _CACHE["v"]
 
+CAP_WAKE_ALARM = 35
+
+def wake_alarm_capable(proc="/proc"):
+    """Whether this user's systemd manager holds CAP_WAKE_ALARM, which WakeSystem= needs to create its timer:
+    True or False, or None if the manager can't be found. Read from the manager's own capability set, since
+    the manager (not this program) creates the timer. Asked once."""
+    if "wake" in _CACHE: return _CACHE["wake"]
+    found = None
+    try: pids = [n for n in os.listdir(proc) if n.isdigit()]
+    except OSError: return None
+    for pid in pids:
+        try:
+            with open(f"{proc}/{pid}/status") as f: status = f.read()
+            with open(f"{proc}/{pid}/cmdline", "rb") as f: argv = f.read().split(b"\0")
+        except OSError: continue                                  # the process ended, or isn't ours to read
+        name, uid, cap = (re.search(rf"^{k}:\s*(\S+)", status, re.M) for k in ("Name", "Uid", "CapEff"))
+        if not (name and uid and cap) or name[1] != "systemd" or int(uid[1]) != os.getuid(): continue
+        if b"--user" not in argv: continue
+        found = bool(int(cap[1], 16) >> CAP_WAKE_ALARM & 1)
+        break
+    _CACHE["wake"] = found
+    return found
+
 class FollowLog:
     """`journalctl -f` for a service. Lines are read in a thread and handed to on_line(text), which therefore
     runs off the main thread. start() returns an error text or None; stop() ends the follow."""
@@ -934,6 +957,7 @@ class FollowLog:
 def task_texts(m):
     """(subtitle, tooltip) of a task row, from what gather() collected."""
     lines = [describe(m["trigger"]) if m["trigger"] else "Custom schedule"]
+    if m.get("adv", {}).get("wake"): lines[0] += " · wakes from sleep"
     if m["enabled"]:
         lines.append("Next: " + (m["next_text"] or "when triggered"))
         if m["fstate"] and m["fstate"] not in BOOT_OK: lines.append("Not enabled: won't start again after a restart")
@@ -969,7 +993,8 @@ def gather():
         m["running"] = svc.get("ActiveState") in ("activating", "active") and not m["retrying"]
     tasks.sort(key=lambda m: m["name"].lower())
     return {"tasks": tasks, "free": unscheduled_services(timers), "linger": linger_state(),
-            "systemd": systemd_version()}
+            "systemd": systemd_version(),
+            "wake_alarm": wake_alarm_capable()}
 
 
 # ---------------------------------------------------------------- crontab
@@ -1353,6 +1378,9 @@ def gui():
                                       subtitle="Resume from suspend at the scheduled time (needs hardware support)")
             if sd is not None and sd < 254:                 # older user managers lack CAP_WAKE_ALARM, so the timer would fail
                 self.wake.set_sensitive(False); self.wake.set_subtitle(f"Needs systemd 254 or newer (this is {sd})")
+            elif win.wake_ok is False:                      # a new enough systemd, but this account's manager lacks it
+                self.wake.set_sensitive(False)
+                self.wake.set_subtitle("Your user session lacks CAP_WAKE_ALARM (systemd gives it to regular accounts, UID 1000 and up)")
             self.retries = Adw.SpinRow.new_with_range(0, 10, 1); self.retries.set_title("Retry on failure")
             self.retries.set_subtitle("How many times to try again; 0 means never"); self.retries.set_value(adv.get("retries", 0))
             self.retry_wait = Adw.SpinRow.new_with_range(1, 1440, 1); self.retry_wait.set_title("Wait between tries (minutes)")
@@ -1750,7 +1778,7 @@ def gui():
             tv.set_content(self.stack); self.overlay.set_child(tv); self.set_content(self.overlay)
             self.services, self.busy, self.again, self.shape, self.has_tasks = [], False, False, None, False
             self.opening = self.importing = False
-            self.sdver = None
+            self.sdver, self.wake_ok = None, None
             self.cur, self.rows, self.syncing = {}, {}, False
             self.stack.set_visible_child_name("loading")
             self.fill()
@@ -1956,7 +1984,7 @@ def gui():
         def render(self, data):
             self.busy = False
             if data is not None:
-                self.has_tasks, self.sdver = bool(data["tasks"]), data["systemd"]
+                self.has_tasks, self.sdver, self.wake_ok = bool(data["tasks"]), data["systemd"], data["wake_alarm"]
                 if data["linger"] != self.linger: self.linger = data["linger"]; self.update_menu()
                 tasks, free = data["tasks"], data["free"]
                 self.cur = {m["timer"]: m for m in tasks}
@@ -2001,7 +2029,7 @@ def cmd_list(as_json=False):
     tasks = gather()["tasks"]
     if as_json:
         print(json.dumps([{"unit": m["unit"], "name": m["name"], "schedule": describe(m["trigger"]) if m["trigger"] else None,
-                           "enabled": m["enabled"], "running": m["running"], "retrying": m.get("retrying", False),
+                           "enabled": m["enabled"], "wake": m.get("adv", {}).get("wake", False), "running": m["running"], "retrying": m.get("retrying", False),
                            "next": m["next"] or None, "last": m["last"]} for m in tasks], indent=2))
         return 0
     if not tasks: print("No tasks"); return 0

@@ -122,6 +122,9 @@ def gui():
                                       subtitle="Resume from suspend at the scheduled time (needs hardware support)")
             if sd is not None and sd < 254:                 # older user managers lack CAP_WAKE_ALARM, so the timer would fail
                 self.wake.set_sensitive(False); self.wake.set_subtitle(f"Needs systemd 254 or newer (this is {sd})")
+            elif win.wake_ok is False:                      # a new enough systemd, but this account's manager lacks it
+                self.wake.set_sensitive(False)
+                self.wake.set_subtitle("Your user session lacks CAP_WAKE_ALARM (systemd gives it to regular accounts, UID 1000 and up)")
             self.retries = Adw.SpinRow.new_with_range(0, 10, 1); self.retries.set_title("Retry on failure")
             self.retries.set_subtitle("How many times to try again; 0 means never"); self.retries.set_value(adv.get("retries", 0))
             self.retry_wait = Adw.SpinRow.new_with_range(1, 1440, 1); self.retry_wait.set_title("Wait between tries (minutes)")
@@ -519,7 +522,7 @@ def gui():
             tv.set_content(self.stack); self.overlay.set_child(tv); self.set_content(self.overlay)
             self.services, self.busy, self.again, self.shape, self.has_tasks = [], False, False, None, False
             self.opening = self.importing = False
-            self.sdver = None
+            self.sdver, self.wake_ok = None, None
             self.cur, self.rows, self.syncing = {}, {}, False
             self.stack.set_visible_child_name("loading")
             self.fill()
@@ -725,7 +728,7 @@ def gui():
         def render(self, data):
             self.busy = False
             if data is not None:
-                self.has_tasks, self.sdver = bool(data["tasks"]), data["systemd"]
+                self.has_tasks, self.sdver, self.wake_ok = bool(data["tasks"]), data["systemd"], data["wake_alarm"]
                 if data["linger"] != self.linger: self.linger = data["linger"]; self.update_menu()
                 tasks, free = data["tasks"], data["free"]
                 self.cur = {m["timer"]: m for m in tasks}

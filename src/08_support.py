@@ -63,6 +63,29 @@ def systemd_version():
         _CACHE["v"] = int(m[1]) if m else None
     return _CACHE["v"]
 
+CAP_WAKE_ALARM = 35
+
+def wake_alarm_capable(proc="/proc"):
+    """Whether this user's systemd manager holds CAP_WAKE_ALARM, which WakeSystem= needs to create its timer:
+    True or False, or None if the manager can't be found. Read from the manager's own capability set, since
+    the manager (not this program) creates the timer. Asked once."""
+    if "wake" in _CACHE: return _CACHE["wake"]
+    found = None
+    try: pids = [n for n in os.listdir(proc) if n.isdigit()]
+    except OSError: return None
+    for pid in pids:
+        try:
+            with open(f"{proc}/{pid}/status") as f: status = f.read()
+            with open(f"{proc}/{pid}/cmdline", "rb") as f: argv = f.read().split(b"\0")
+        except OSError: continue                                  # the process ended, or isn't ours to read
+        name, uid, cap = (re.search(rf"^{k}:\s*(\S+)", status, re.M) for k in ("Name", "Uid", "CapEff"))
+        if not (name and uid and cap) or name[1] != "systemd" or int(uid[1]) != os.getuid(): continue
+        if b"--user" not in argv: continue
+        found = bool(int(cap[1], 16) >> CAP_WAKE_ALARM & 1)
+        break
+    _CACHE["wake"] = found
+    return found
+
 class FollowLog:
     """`journalctl -f` for a service. Lines are read in a thread and handed to on_line(text), which therefore
     runs off the main thread. start() returns an error text or None; stop() ends the follow."""
@@ -95,6 +118,7 @@ class FollowLog:
 def task_texts(m):
     """(subtitle, tooltip) of a task row, from what gather() collected."""
     lines = [describe(m["trigger"]) if m["trigger"] else "Custom schedule"]
+    if m.get("adv", {}).get("wake"): lines[0] += " · wakes from sleep"
     if m["enabled"]:
         lines.append("Next: " + (m["next_text"] or "when triggered"))
         if m["fstate"] and m["fstate"] not in BOOT_OK: lines.append("Not enabled: won't start again after a restart")
@@ -130,6 +154,7 @@ def gather():
         m["running"] = svc.get("ActiveState") in ("activating", "active") and not m["retrying"]
     tasks.sort(key=lambda m: m["name"].lower())
     return {"tasks": tasks, "free": unscheduled_services(timers), "linger": linger_state(),
-            "systemd": systemd_version()}
+            "systemd": systemd_version(),
+            "wake_alarm": wake_alarm_capable()}
 
 

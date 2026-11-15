@@ -13,7 +13,7 @@ def cmd_list(as_json=False):
     tasks = gather()["tasks"]
     if as_json:
         print(json.dumps([{"unit": m["unit"], "name": m["name"], "schedule": describe(m["trigger"]) if m["trigger"] else None,
-                           "enabled": m["enabled"], "running": m["running"], "retrying": m.get("retrying", False),
+                           "enabled": m["enabled"], "wake": m.get("adv", {}).get("wake", False), "running": m["running"], "retrying": m.get("retrying", False),
                            "next": m["next"] or None, "last": m["last"]} for m in tasks], indent=2))
         return 0
     if not tasks: print("No tasks"); return 0

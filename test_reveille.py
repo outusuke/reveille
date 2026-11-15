@@ -846,6 +846,9 @@ class CommandLine(Base):
         row = json.loads(out)[0]
         self.assertEqual(code, 0)
         self.assertEqual((row["unit"], row["schedule"], row["last"]["rc"], row["retrying"]), ("nightly", "Every day at 03:00", 1, False))
+        self.assertIs(row["wake"], False)
+        rv.gather = lambda: {"tasks": [{**m, "adv": {"wake": True}}], "free": []}
+        self.assertIs(json.loads(self.run_main("list", "--json")[1])[0]["wake"], True)
 
     def test_list_prints_tasks_or_says_there_are_none(self):
         rv.gather = lambda: {"tasks": [], "free": []}
@@ -1308,6 +1311,40 @@ class WakeSystem(Editable):
         os.makedirs(f"{rv.UNITS}/x.timer.d", exist_ok=True); write("x.timer.d/o.conf", "[Timer]\nWakeSystem=true\n")
         m = rv.load_task("x.timer")
         self.assertIn("WakeSystem=", m["why"])
+
+
+class WakeVisibility(unittest.TestCase):
+    """Wake from sleep shows in the row and the JSON, and the capability is read from the user manager."""
+    def fake_proc(self, procs):
+        root = tempfile.mkdtemp(dir=TMP)
+        for pid, (name, uid, cap, argv) in procs.items():
+            os.makedirs(f"{root}/{pid}")
+            with open(f"{root}/{pid}/status", "w") as f: f.write(f"Name:\t{name}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nCapEff:\t{cap}\n")
+            with open(f"{root}/{pid}/cmdline", "wb") as f: f.write(b"\0".join(a.encode() for a in argv) + b"\0")
+        return root
+
+    def setUp(self): rv._CACHE.clear()
+    tearDown = setUp
+
+    def test_capability_bit_of_the_user_manager(self):
+        me, bit = os.getuid(), 1 << rv.CAP_WAKE_ALARM
+        for cap, want in ((f"{bit:016x}", True), (f"{bit - 1:016x}", False)):
+            rv._CACHE.clear()
+            root = self.fake_proc({100: ("systemd", 0, f"{bit:016x}", ["/sbin/init"]),          # PID 1 and others' managers don't count
+                                   200: ("systemd", me + 1, f"{bit:016x}", ["systemd", "--user"]),
+                                   300: ("systemd", me, cap, ["/usr/lib/systemd/systemd", "--user"])})
+            self.assertIs(rv.wake_alarm_capable(root), want, cap)
+
+    def test_unknown_when_no_manager_is_found_and_asked_once(self):
+        self.assertIsNone(rv.wake_alarm_capable(self.fake_proc({1: ("bash", os.getuid(), "0", ["bash"])})))
+        self.assertIsNone(rv.wake_alarm_capable(f"{TMP}/no-such-proc"))
+
+    def test_row_text_and_json_say_it(self):
+        m = {"trigger": {**rv.DEFAULT_TR}, "enabled": True, "next_text": "tomorrow", "next": "x", "fstate": "enabled",
+             "last": None, "running": False, "adv": {"wake": True}}
+        self.assertIn("wakes from sleep", rv.task_texts(m)[0].splitlines()[0])
+        self.assertNotIn("wakes", rv.task_texts({**m, "adv": {"wake": False}})[0])
+        self.assertNotIn("wakes", rv.task_texts({k: v for k, v in m.items() if k != "adv"})[0])
 
 
 class DropIns(Editable):
