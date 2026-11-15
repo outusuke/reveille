@@ -131,15 +131,20 @@ def gui():
             self.retry_wait.set_value(adv.get("retry_wait", 5))
             self.low = Adw.SwitchRow(title="Run at low priority", active=adv.get("low", False),
                                      subtitle="Lowest CPU and disk priority, so it doesn't slow down your work")
-            self.path = Adw.EntryRow(title="Only if this path exists (start with ! to require it missing)",
-                                     text=adv.get("path", ""))
-            self.cond = Adw.EntryRow(title="Only if this command succeeds (exit 1 to 254 skips the run)",
-                                     text=adv.get("condition", ""))
+            # An entry row's title is one line that ends in "…" while the box is empty, so the titles are short and the
+            # longer explanation is the row's tooltip.
+            self.path = Adw.EntryRow(title="Only if this path exists", text=adv.get("path", ""))
+            self.path.set_tooltip_text("Start with ! to require the path to be missing")
+            self.cond = Adw.EntryRow(title="Only if this command succeeds", text=adv.get("condition", ""))
+            self.cond.set_tooltip_text("Runs just before the task. Exit 1 to 254 skips the run quietly; "
+                                       "255 or a crash counts as a failure")
             if sd is not None and sd < 243:
                 self.cond.set_sensitive(False)
-                self.cond.set_title(f"Only if this command succeeds (needs systemd 243 or newer, this is {sd})")
-            self.after = Adw.EntryRow(title="After it finishes, run this command (also after a failure or a skipped run)",
-                                      text=adv.get("after", ""))
+                self.cond.set_title("Only if this command succeeds (needs systemd 243+)")
+                self.cond.set_tooltip_text(f"This is systemd {sd}")
+            self.after = Adw.EntryRow(title="After it finishes, run this command", text=adv.get("after", ""))
+            self.after.set_tooltip_text("Runs once the task has stopped: after success, after a failure, or when the "
+                                        "condition above skipped the run. To use $SERVICE_RESULT, run a shell")
             others = [x for x in found if x != (m or {}).get("service")]
             def picker(title, subtitle, cur, extra=()):    # "None" plus the services; a current value that isn't listed stays
                 items, sel = pick_list(list(extra) + others, cur)
