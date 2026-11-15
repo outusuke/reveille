@@ -808,6 +808,40 @@ class Paths(Base):
         with self.assertRaises(ValueError): self.units(path="relative/file")
 
 
+class SaveRollback(Base):
+    """A save that fails half way leaves the files as they were."""
+
+    def failing_timer_write(self):
+        real = rv.write_atomic
+        def w(path, text):
+            if path.endswith(".timer"): raise OSError(28, "No space left on device")
+            real(path, text)
+        return real, w
+
+    def test_new_task_leaves_no_files(self):
+        t = task(); real, rv.write_atomic = self.failing_timer_write()
+        try: err = rv.apply_task(t)
+        finally: rv.write_atomic = real
+        self.assertIn("Could not write", err)
+        self.assertFalse(os.path.exists(f"{rv.UNITS}/{t['unit']}.service"))
+
+    def test_edit_restores_old_service(self):
+        t = task(); self.assertIsNone(rv.apply_task(t))
+        path = f"{rv.UNITS}/{t['unit']}.service"; before = read(path)
+        real, rv.write_atomic = self.failing_timer_write()
+        try: err = rv.apply_task(task(unit=t["unit"], command="/bin/true"))
+        finally: rv.write_atomic = real
+        self.assertIn("Could not write", err)
+        self.assertEqual(read(path), before)
+
+
+class UniqueBase(Base):
+    def test_given_set_is_not_refetched_and_grows(self):
+        taken = set()
+        self.assertEqual(rv.unique_base("Job", taken), "job")
+        self.assertEqual(rv.unique_base("Job", taken), "job-2")
+
+
 class Reliability(Base):
     """Retry on failure, low priority, a path condition and "then run", written to and read back from units."""
 

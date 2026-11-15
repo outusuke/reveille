@@ -61,16 +61,23 @@ def apply_task(t):
     """Write the units for a task and (de)activate its timer. Returns an error text or None."""
     base = f"{UNITS}/{t['unit']}"
     service, timer = unit_texts(t, read_text(base + ".service"), read_text(base + ".timer"))
+    undo = []                                  # how to put each file back if a later write fails
     try:
         os.makedirs(UNITS, exist_ok=True)
         for ext, text in ((".service", service), (".timer", timer)):
+            path, existed = base + ext, os.path.exists(base + ext)
             if text is None:                   # the task was switched to an existing service: keep a backup
-                if os.path.exists(base + ext):
-                    try: os.replace(base + ext, base + ext + ".reveille-bak")
+                if existed:
+                    try: os.replace(path, path + ".reveille-bak"); undo.append(lambda p=path: os.replace(p + ".reveille-bak", p))
                     except OSError: pass
                 continue
-            write_atomic(base + ext, text)
+            prev = read_text(path)
+            write_atomic(path, text)
+            undo.append((lambda p=path, v=prev: write_atomic(p, v)) if existed else (lambda p=path: os.unlink(p)))
     except OSError as e:
+        for f in reversed(undo):
+            try: f()
+            except OSError: pass
         return f"Could not write the unit files: {e.strerror or e}"
     ctl("daemon-reload")
     unit = f"{t['unit']}.timer"

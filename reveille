@@ -651,13 +651,15 @@ def list_services():
             add(n)
     return sorted(names)
 
-def unique_base(name):
-    """A unit name derived from the task name that clashes with no existing file or service."""
+def unique_base(name, taken=None):
+    """A unit name derived from the task name that clashes with no existing file or service. `taken` (a set of
+    service names) saves asking systemd again when many names are picked in a row."""
     stem = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "task"
-    taken = set(list_services())
+    taken = set(list_services()) if taken is None else taken
     base, i = stem, 2
     while (f"{base}.service" in taken or any(os.path.exists(f"{UNITS}/{base}{e}") for e in (".service", ".timer"))):
         base = f"{stem}-{i}"; i += 1
+    taken.add(f"{base}.service")
     return base
 
 
@@ -723,16 +725,23 @@ def apply_task(t):
     """Write the units for a task and (de)activate its timer. Returns an error text or None."""
     base = f"{UNITS}/{t['unit']}"
     service, timer = unit_texts(t, read_text(base + ".service"), read_text(base + ".timer"))
+    undo = []                                  # how to put each file back if a later write fails
     try:
         os.makedirs(UNITS, exist_ok=True)
         for ext, text in ((".service", service), (".timer", timer)):
+            path, existed = base + ext, os.path.exists(base + ext)
             if text is None:                   # the task was switched to an existing service: keep a backup
-                if os.path.exists(base + ext):
-                    try: os.replace(base + ext, base + ext + ".reveille-bak")
+                if existed:
+                    try: os.replace(path, path + ".reveille-bak"); undo.append(lambda p=path: os.replace(p + ".reveille-bak", p))
                     except OSError: pass
                 continue
-            write_atomic(base + ext, text)
+            prev = read_text(path)
+            write_atomic(path, text)
+            undo.append((lambda p=path, v=prev: write_atomic(p, v)) if existed else (lambda p=path: os.unlink(p)))
     except OSError as e:
+        for f in reversed(undo):
+            try: f()
+            except OSError: pass
         return f"Could not write the unit files: {e.strerror or e}"
     ctl("daemon-reload")
     unit = f"{t['unit']}.timer"
@@ -1129,10 +1138,10 @@ def import_summary(results, enabled):
 def import_crontab(plan, enabled=True):
     """Create the planned tasks. Returns [(entry, unit name, error text or None)]. Each unit name is picked just before
     its task is written, so two entries with the same name can't collide."""
-    done = []
+    done, taken = [], set(list_services())
     for it in plan:
         if it["status"] != "new": continue
-        t = {**it["task"], "unit": unique_base(it["task"]["name"]), "enabled": enabled}
+        t = {**it["task"], "unit": unique_base(it["task"]["name"], taken), "enabled": enabled}
         try: err = apply_task(t)
         except ValueError as x: err = str(x)
         done.append((it, t["unit"], err))

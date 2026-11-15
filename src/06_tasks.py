@@ -177,13 +177,15 @@ def list_services():
             add(n)
     return sorted(names)
 
-def unique_base(name):
-    """A unit name derived from the task name that clashes with no existing file or service."""
+def unique_base(name, taken=None):
+    """A unit name derived from the task name that clashes with no existing file or service. `taken` (a set of
+    service names) saves asking systemd again when many names are picked in a row."""
     stem = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "task"
-    taken = set(list_services())
+    taken = set(list_services()) if taken is None else taken
     base, i = stem, 2
     while (f"{base}.service" in taken or any(os.path.exists(f"{UNITS}/{base}{e}") for e in (".service", ".timer"))):
         base = f"{stem}-{i}"; i += 1
+    taken.add(f"{base}.service")
     return base
 
 

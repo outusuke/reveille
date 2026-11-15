@@ -197,10 +197,10 @@ def import_summary(results, enabled):
 def import_crontab(plan, enabled=True):
     """Create the planned tasks. Returns [(entry, unit name, error text or None)]. Each unit name is picked just before
     its task is written, so two entries with the same name can't collide."""
-    done = []
+    done, taken = [], set(list_services())
     for it in plan:
         if it["status"] != "new": continue
-        t = {**it["task"], "unit": unique_base(it["task"]["name"]), "enabled": enabled}
+        t = {**it["task"], "unit": unique_base(it["task"]["name"], taken), "enabled": enabled}
         try: err = apply_task(t)
         except ValueError as x: err = str(x)
         done.append((it, t["unit"], err))
