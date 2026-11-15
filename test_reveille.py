@@ -787,6 +787,27 @@ def adv(**kw):
     return {"cwd": "", "env": "", "timeout": 0, "ac": False, "online": False, "delay": 0, **kw}
 
 
+class Paths(Base):
+    """~ is expanded and relative paths are refused, because systemd would ignore or reject them."""
+
+    def units(self, **kw):
+        return rv.unit_texts(task(adv=adv(**kw)))[0]
+
+    def test_tilde_expanded_in_cwd_and_command(self):
+        home = os.path.expanduser("~")
+        svc = self.units(cwd="~/proj")
+        self.assertIn(f"WorkingDirectory={home}/proj", svc)
+        self.assertIn(f"ExecStart=/bin/echo {home}/a", rv.unit_texts(task(command="/bin/echo ~/a"))[0])
+
+    def test_path_condition_expanded_and_negation_kept(self):
+        home = os.path.expanduser("~")
+        self.assertIn(f"ConditionPathExists=!{home}/skip", self.units(path="!~/skip"))
+
+    def test_relative_paths_refused(self):
+        with self.assertRaises(ValueError): self.units(cwd="proj")
+        with self.assertRaises(ValueError): self.units(path="relative/file")
+
+
 class Reliability(Base):
     """Retry on failure, low priority, a path condition and "then run", written to and read back from units."""
 

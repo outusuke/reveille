@@ -1,5 +1,13 @@
 #: layer 07: writing and removing units, enabling timers, starting services
 # ---------------------------------------------------------------- writing units
+def abs_path(path, what):
+    """`path` with a leading ~ expanded (systemd only knows a bare ~), which must then be absolute.
+    A leading ! (condition negation) is kept. Raises ValueError saying which field is wrong."""
+    neg = path.startswith("!")
+    full = os.path.expanduser(path[neg:])
+    if not os.path.isabs(full): raise ValueError(f"{what} must be an absolute path (or start with ~)")
+    return ("!" if neg else "") + full
+
 def unit_texts(t, old_service="", old_timer=""):
     """(service text or None, timer text). A task that triggers an existing service has no service of its own.
     The old file texts are merged, so lines the editor doesn't manage (ExecCondition=, comments, ...) survive.
@@ -14,7 +22,7 @@ def unit_texts(t, old_service="", old_timer=""):
         unit = [f"Description={esc(name)}"] if desc else []
         if adv.get("ac"): unit.append("ConditionACPower=true")
         if adv.get("online"): unit += [f"Wants={ONLINE}", f"After={ONLINE}"]
-        if adv.get("path"): unit.append(f"ConditionPathExists={esc(adv['path'])}")
+        if adv.get("path"): unit.append(f"ConditionPathExists={esc(abs_path(adv['path'], 'The path condition'))}")
         if adv.get("then"): unit.append(f"OnSuccess={adv['then']}")
         if adv.get("fail"): unit.append(f"OnFailure={adv['fail']}")
         retries = int(adv.get("retries") or 0)
@@ -23,7 +31,7 @@ def unit_texts(t, old_service="", old_timer=""):
                              f"StartLimitBurst={retries + 1}"]
         low = bool(adv.get("low"))
         svc = [] if old_service else ["Type=oneshot"]
-        if adv.get("cwd"): svc.append(f"WorkingDirectory={esc(adv['cwd'])}")
+        if adv.get("cwd"): svc.append(f"WorkingDirectory={esc(abs_path(adv['cwd'], 'The working directory'))}")
         for kv in shlex.split(adv.get("env", "")): svc.append(f"Environment={shlex.quote(esc(kv))}")   # no $ expansion here
         if adv.get("timeout"): svc.append(f"TimeoutStartSec={int(adv['timeout'])}min")
         if retries: svc += ["Restart=on-failure", f"RestartSec={wait}min"]

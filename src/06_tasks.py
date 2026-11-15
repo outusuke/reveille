@@ -14,6 +14,7 @@ def build_exec(t):
     else:
         tokens = shlex.split(t["command"])
         if not tokens: raise ValueError("Enter a valid command")
+        tokens = [os.path.expanduser(x) if x.startswith("~") else x for x in tokens]   # a shell would; ExecStart= doesn't
         if not os.path.isabs(tokens[0]):
             found = shutil.which(tokens[0])
             if not found: raise ValueError(f"{tokens[0]} was not found in PATH")
