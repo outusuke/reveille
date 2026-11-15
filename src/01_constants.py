@@ -27,10 +27,15 @@ TIMER_KEYS = set(SCHEDULE_KEYS) | {"AccuracySec"}              # what a save of 
 # Settings the editor manages in the service. A drop-in that sets one of them makes what the editor shows untrue.
 UNIT_KEYS = {"ConditionACPower", "Wants", "After", "ConditionPathExists", "OnSuccess", "OnFailure",
              "StartLimitIntervalSec", "StartLimitBurst"}
-SERVICE_KEYS = {"WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice", "IOSchedulingClass"}
+SERVICE_KEYS = {"ExecStartPre", "WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice", "IOSchedulingClass"}
 SERVICE_DROPIN_KEYS = {"Unit": UNIT_KEYS, "Service": SERVICE_KEYS | {"ExecStart", "KillMode"}}
 TIMER_DROPIN_KEYS = {"Timer": set(SCHEDULE_KEYS) | {"Unit"}, "Unit": {"Description"}}
-ONLINE = "network-online.target"
+ONLINE = "network-online.target"   # no such target in a user session, so only an older reveille wrote (and still shows) it
+# "Wait for the network": nm-online if NetworkManager's tool is installed, else wait for an IPv4 default route; at most
+# 60 s either way, and the task runs regardless. The value as it stands in the file ($ doubled).
+WAIT_NET = ("/bin/sh -c 'if command -v nm-online >/dev/null 2>&1; then nm-online -q -t 60; exit 0; fi; "
+            "for i in $$(seq 60); do grep -qs \"^[^[:space:]]*[[:space:]]00000000\" /proc/net/route && exit 0; "
+            "sleep 1; done; exit 0'")
 BOOT_OK = {"enabled", "enabled-runtime", "indirect", "alias"}     # UnitFileState values that survive a restart
 
 

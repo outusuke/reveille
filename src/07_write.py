@@ -21,7 +21,6 @@ def unit_texts(t, old_service="", old_timer=""):
         keep_exec = bool(t.get("keep_exec") and old_service)
         unit = [f"Description={esc(name)}"] if desc else []
         if adv.get("ac"): unit.append("ConditionACPower=true")
-        if adv.get("online"): unit += [f"Wants={ONLINE}", f"After={ONLINE}"]
         if adv.get("path"): unit.append(f"ConditionPathExists={esc(abs_path(adv['path'], 'The path condition'))}")
         if adv.get("then"): unit.append(f"OnSuccess={adv['then']}")
         if adv.get("fail"): unit.append(f"OnFailure={adv['fail']}")
@@ -36,9 +35,11 @@ def unit_texts(t, old_service="", old_timer=""):
         if adv.get("timeout"): svc.append(f"TimeoutStartSec={int(adv['timeout'])}min")
         if retries: svc += ["Restart=on-failure", f"RestartSec={wait}min"]
         if low: svc += ["Nice=19", "IOSchedulingClass=idle"]
+        if adv.get("online"): svc.append(f"ExecStartPre={WAIT_NET}")
         if t["kind"] == "app": svc.append("KillMode=process")    # the launcher exits at once: don't kill the app it started
         if not keep_exec: svc.append(f"ExecStart={build_exec(t)}")
         def keep_svc(k, v):                # a Nice= or IOSchedulingClass= that isn't the low-priority preset stays
+            if k == "ExecStartPre": return v != WAIT_NET             # the user's own ExecStartPre= lines stay
             return not low and ((k == "Nice" and v != "19") or (k == "IOSchedulingClass" and v != "idle"))
         def keep_unit(k, v):               # keep dependencies and conditions that aren't ours
             if k == "ConditionACPower": return v != "true"

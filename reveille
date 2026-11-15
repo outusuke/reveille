@@ -43,10 +43,15 @@ TIMER_KEYS = set(SCHEDULE_KEYS) | {"AccuracySec"}              # what a save of 
 # Settings the editor manages in the service. A drop-in that sets one of them makes what the editor shows untrue.
 UNIT_KEYS = {"ConditionACPower", "Wants", "After", "ConditionPathExists", "OnSuccess", "OnFailure",
              "StartLimitIntervalSec", "StartLimitBurst"}
-SERVICE_KEYS = {"WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice", "IOSchedulingClass"}
+SERVICE_KEYS = {"ExecStartPre", "WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice", "IOSchedulingClass"}
 SERVICE_DROPIN_KEYS = {"Unit": UNIT_KEYS, "Service": SERVICE_KEYS | {"ExecStart", "KillMode"}}
 TIMER_DROPIN_KEYS = {"Timer": set(SCHEDULE_KEYS) | {"Unit"}, "Unit": {"Description"}}
-ONLINE = "network-online.target"
+ONLINE = "network-online.target"   # no such target in a user session, so only an older reveille wrote (and still shows) it
+# "Wait for the network": nm-online if NetworkManager's tool is installed, else wait for an IPv4 default route; at most
+# 60 s either way, and the task runs regardless. The value as it stands in the file ($ doubled).
+WAIT_NET = ("/bin/sh -c 'if command -v nm-online >/dev/null 2>&1; then nm-online -q -t 60; exit 0; fi; "
+            "for i in $$(seq 60); do grep -qs \"^[^[:space:]]*[[:space:]]00000000\" /proc/net/route && exit 0; "
+            "sleep 1; done; exit 0'")
 BOOT_OK = {"enabled", "enabled-runtime", "indirect", "alias"}     # UnitFileState values that survive a restart
 
 
@@ -534,7 +539,7 @@ def parse_service(name):
     fail = [x for v in un.get("OnFailure", []) for x in v.split()]
     if len(fail) > 1: return {"why": "OnFailure= lists more than one unit"}
     adv = {"cwd": unesc(sv.get("WorkingDirectory", [""])[-1]), "env": " ".join(shlex.quote(x) for x in env),
-           "timeout": timeout, "ac": "true" in un.get("ConditionACPower", []), "online": ONLINE in deps,
+           "timeout": timeout, "ac": "true" in un.get("ConditionACPower", []), "online": ONLINE in deps or WAIT_NET in sv.get("ExecStartPre", []),
            "retries": retries, "retry_wait": wait,
            "low": sv.get("Nice") == ["19"] and sv.get("IOSchedulingClass") == ["idle"],
            "path": unesc(paths[0]) if paths else "", "then": then[0] if then else "",
@@ -580,6 +585,7 @@ def dropin_info(unit, watched):
             for k, vals in u.get(sect, {}).items():
                 if k not in keys: continue
                 if k in ("Wants", "After") and not any(ONLINE in v.split() for v in vals): continue   # only the network one is ours
+                if k == "ExecStartPre" and WAIT_NET not in vals: continue                             # likewise
                 hit.append(f"{k}=")
         if hit: why.append(f"the drop-in {unit}.d/{n} also sets {', '.join(sorted(hit))}")
     return [f"{unit}.d/{n}" for n in names], "; ".join(why)
@@ -685,7 +691,6 @@ def unit_texts(t, old_service="", old_timer=""):
         keep_exec = bool(t.get("keep_exec") and old_service)
         unit = [f"Description={esc(name)}"] if desc else []
         if adv.get("ac"): unit.append("ConditionACPower=true")
-        if adv.get("online"): unit += [f"Wants={ONLINE}", f"After={ONLINE}"]
         if adv.get("path"): unit.append(f"ConditionPathExists={esc(abs_path(adv['path'], 'The path condition'))}")
         if adv.get("then"): unit.append(f"OnSuccess={adv['then']}")
         if adv.get("fail"): unit.append(f"OnFailure={adv['fail']}")
@@ -700,9 +705,11 @@ def unit_texts(t, old_service="", old_timer=""):
         if adv.get("timeout"): svc.append(f"TimeoutStartSec={int(adv['timeout'])}min")
         if retries: svc += ["Restart=on-failure", f"RestartSec={wait}min"]
         if low: svc += ["Nice=19", "IOSchedulingClass=idle"]
+        if adv.get("online"): svc.append(f"ExecStartPre={WAIT_NET}")
         if t["kind"] == "app": svc.append("KillMode=process")    # the launcher exits at once: don't kill the app it started
         if not keep_exec: svc.append(f"ExecStart={build_exec(t)}")
         def keep_svc(k, v):                # a Nice= or IOSchedulingClass= that isn't the low-priority preset stays
+            if k == "ExecStartPre": return v != WAIT_NET             # the user's own ExecStartPre= lines stay
             return not low and ((k == "Nice" and v != "19") or (k == "IOSchedulingClass" and v != "idle"))
         def keep_unit(k, v):               # keep dependencies and conditions that aren't ours
             if k == "ConditionACPower": return v != "true"

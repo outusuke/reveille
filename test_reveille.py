@@ -184,7 +184,7 @@ class Editable(Base):
         adv = {"cwd": "/tmp", "env": "A=1", "timeout": 5, "ac": True, "online": True, "delay": 0}
         svc, _ = self.save(m, adv=adv)
         for line in ("WorkingDirectory=/tmp", "Environment=A=1", "TimeoutStartSec=5min", "ConditionACPower=true",
-                     "Wants=network-online.target", "ExecCondition="):
+                     f"ExecStartPre={rv.WAIT_NET}", "ExecCondition="):
             self.assertIn(line, svc)
         write("x.service", svc)
         s2 = rv.parse_service("x.service")
@@ -388,7 +388,8 @@ class Fixes(Editable):
         m = self.load(svc)
         out, _ = self.save(m, adv={**m["adv"], "online": True})
         self.assertIn("After=graphical-session.target", out)
-        self.assertIn("After=network-online.target", out)
+        self.assertIn(f"ExecStartPre={rv.WAIT_NET}", out)
+        self.assertNotIn("network-online.target", out)               # a user session has no such target
 
     def test_dollar_is_not_doubled_in_environment(self):
         rv.apply_task(task(adv={"env": "A=p$q B=100%"}))
@@ -887,6 +888,56 @@ class DeleteStops(Base):
         self.assertIn(("stop", f"{t['unit']}.service"), CALLS)
         self.assertIn(("reset-failed", f"{t['unit']}.service"), CALLS)
         self.assertLess(CALLS.index(("disable", "--now", f"{t['unit']}.timer")), CALLS.index(("stop", f"{t['unit']}.service")))
+
+
+class WaitForNetwork(Base):
+    def units(self, **kw):
+        return rv.unit_texts(task(adv=adv(**kw)))[0]
+
+    def test_written_as_one_escaped_exec_start_pre_and_read_back(self):
+        svc = self.units(online=True)
+        self.assertIn(f"ExecStartPre={rv.WAIT_NET}", svc)
+        self.assertIn("$$(seq 60)", svc)                           # systemd would otherwise expand $(...) itself
+        self.assertNotIn("network-online.target", svc)
+        write("w.service", svc)
+        self.assertTrue(rv.parse_service("w.service")["adv"]["online"])
+        self.assertFalse(rv.parse_service("w.service")["adv"]["low"])
+
+    def run_wait(self, tools, extra=None):
+        """Run the wait command with a PATH holding only `tools` (plus fakes), so the machine's own nm-online can't interfere."""
+        import shlex, subprocess
+        d = tempfile.mkdtemp()
+        try:
+            for name in tools: os.symlink(shutil.which(name), f"{d}/{name}")
+            for name, body in (extra or {}).items():
+                with open(f"{d}/{name}", "w") as f: f.write(f"#!/bin/sh\n{body}\n")
+                os.chmod(f"{d}/{name}", 0o755)
+            argv = shlex.split(rv.WAIT_NET.replace("$$", "$"))
+            argv[2] = argv[2].replace("seq 60", "seq 1")
+            return subprocess.run(argv, env={"PATH": d}, timeout=15).returncode, d
+        finally: shutil.rmtree(d)
+
+    def test_uses_nm_online_when_it_is_installed(self):
+        log = tempfile.mktemp()
+        try:
+            code, _ = self.run_wait([], {"nm-online": f'echo "$@" > {log}; exit 1'})     # even a timeout lets the task run
+            self.assertEqual(code, 0)
+            with open(log) as f: self.assertEqual(f.read().strip(), "-q -t 60")
+        finally:
+            if os.path.exists(log): os.unlink(log)
+
+    def test_falls_back_to_polling_for_a_route(self):
+        code, _ = self.run_wait(["grep", "sleep", "seq"])
+        self.assertEqual(code, 0)
+
+    def test_turning_it_off_keeps_the_users_own_exec_start_pre(self):
+        old = SIMPLE_SERVICE.replace("ExecStart=", f"ExecStartPre=/bin/true\nExecStartPre={rv.WAIT_NET}\nExecStart=")
+        svc = rv.unit_texts(task(adv=adv()), old, SIMPLE_TIMER)[0]
+        self.assertIn("ExecStartPre=/bin/true", svc); self.assertNotIn("seq 60", svc)
+
+    def test_older_units_with_the_target_still_show_as_on(self):
+        write("o.service", SIMPLE_SERVICE.replace("[Service]", "Wants=network-online.target\nAfter=network-online.target\n\n[Service]"))
+        self.assertTrue(rv.parse_service("o.service")["adv"]["online"])
 
 
 class UniqueBase(Base):

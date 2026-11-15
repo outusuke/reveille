@@ -60,7 +60,7 @@ def parse_service(name):
     fail = [x for v in un.get("OnFailure", []) for x in v.split()]
     if len(fail) > 1: return {"why": "OnFailure= lists more than one unit"}
     adv = {"cwd": unesc(sv.get("WorkingDirectory", [""])[-1]), "env": " ".join(shlex.quote(x) for x in env),
-           "timeout": timeout, "ac": "true" in un.get("ConditionACPower", []), "online": ONLINE in deps,
+           "timeout": timeout, "ac": "true" in un.get("ConditionACPower", []), "online": ONLINE in deps or WAIT_NET in sv.get("ExecStartPre", []),
            "retries": retries, "retry_wait": wait,
            "low": sv.get("Nice") == ["19"] and sv.get("IOSchedulingClass") == ["idle"],
            "path": unesc(paths[0]) if paths else "", "then": then[0] if then else "",
@@ -106,6 +106,7 @@ def dropin_info(unit, watched):
             for k, vals in u.get(sect, {}).items():
                 if k not in keys: continue
                 if k in ("Wants", "After") and not any(ONLINE in v.split() for v in vals): continue   # only the network one is ours
+                if k == "ExecStartPre" and WAIT_NET not in vals: continue                             # likewise
                 hit.append(f"{k}=")
         if hit: why.append(f"the drop-in {unit}.d/{n} also sets {', '.join(sorted(hit))}")
     return [f"{unit}.d/{n}" for n in names], "; ".join(why)
