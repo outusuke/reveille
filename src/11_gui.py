@@ -138,7 +138,7 @@ def gui():
             if sd is not None and sd < 243:
                 self.cond.set_sensitive(False)
                 self.cond.set_title(f"Only if this command succeeds (needs systemd 243 or newer, this is {sd})")
-            self.after = Adw.EntryRow(title="After it finishes, run this command (also after a failure)",
+            self.after = Adw.EntryRow(title="After it finishes, run this command (also after a failure or a skipped run)",
                                       text=adv.get("after", ""))
             others = [x for x in found if x != (m or {}).get("service")]
             def picker(title, subtitle, cur, extra=()):    # "None" plus the services; a current value that isn't listed stays
