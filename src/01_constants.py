@@ -30,6 +30,7 @@ UNIT_KEYS = {"ConditionACPower", "Wants", "After", "ConditionPathExists", "OnSuc
 SERVICE_KEYS = {"ExecStartPre", "WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice", "IOSchedulingClass"}
 SERVICE_DROPIN_KEYS = {"Unit": UNIT_KEYS, "Service": SERVICE_KEYS | {"ExecStart", "KillMode"}}
 TIMER_DROPIN_KEYS = {"Timer": set(SCHEDULE_KEYS) | {"Unit"}, "Unit": {"Description"}}
+NOTIFY_UNIT = "reveille-notify@%n.service"   # an "If it fails, run" choice: a desktop notification naming the failed unit
 ONLINE = "network-online.target"   # no such target in a user session, so only an older reveille wrote (and still shows) it
 # "Wait for the network": nm-online if NetworkManager's tool is installed, else wait for an IPv4 default route; at most
 # 60 s either way, and the task runs regardless. The value as it stands in the file ($ doubled).

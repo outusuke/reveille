@@ -45,7 +45,7 @@ These live under Advanced in the editor and apply to apps and commands (not to a
 - **Run at low priority**: `Nice=19` and `IOSchedulingClass=idle`. A different `Nice=` or `IOSchedulingClass=` you wrote by hand is left alone while this is off.
 - **Only if this path exists**: `ConditionPathExists=`. Start the path with `!` to require that it is missing. When the condition fails systemd skips the run without error.
 - **Then run**: starts another service after this one succeeds (`OnSuccess=`).
-- **If it fails, run**: starts another service when this one fails (`OnFailure=`), for example one that sends you a notification. With retries on, it starts only after the last try has failed, because systemd counts a task as failed only then. Both pickers refuse a choice that would make tasks run each other in a loop, whether the chain goes through success or failure links.
+- **If it fails, run**: starts another service when this one fails (`OnFailure=`), for example one that sends you a notification (choose `reveille-notify@%n.service` and reveille creates that helper, which needs `notify-send`). With retries on, it starts only after the last try has failed, because systemd counts a task as failed only then. Both pickers refuse a choice that would make tasks run each other in a loop, whether the chain goes through success or failure links.
 - **Wait for the network**: waits up to 60 seconds (`nm-online` if installed, else an IPv4 default route), then runs anyway. A user session has no `network-online.target`, so ordering against it does nothing.
 
 ## Importing a crontab

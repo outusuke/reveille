@@ -940,6 +940,37 @@ class WaitForNetwork(Base):
         self.assertTrue(rv.parse_service("o.service")["adv"]["online"])
 
 
+class NotifyOnFailure(Base):
+    def setUp(self):
+        super().setUp(); self._which = shutil.which
+        shutil.which = lambda n, **k: "/usr/bin/notify-send" if n == "notify-send" else self._which(n, **k)
+
+    def tearDown(self): shutil.which = self._which
+
+    def test_choosing_it_creates_the_helper_and_reads_back(self):
+        t = task(adv=adv(fail=rv.NOTIFY_UNIT)); self.assertIsNone(rv.apply_task(t))
+        helper = read(f"{rv.UNITS}/reveille-notify@.service")
+        self.assertIn("ExecStart=/usr/bin/notify-send", helper); self.assertIn("%I", helper)
+        self.assertIn(f"OnFailure={rv.NOTIFY_UNIT}", read(f"{rv.UNITS}/{t['unit']}.service"))
+        self.assertEqual(rv.load_task(f"{t['unit']}.timer")["adv"]["fail"], rv.NOTIFY_UNIT)
+
+    def test_an_existing_helper_is_not_overwritten(self):
+        write("reveille-notify@.service", "[Service]\nExecStart=/bin/true\n")
+        self.assertIsNone(rv.apply_task(task(adv=adv(fail=rv.NOTIFY_UNIT))))
+        self.assertEqual(read(f"{rv.UNITS}/reveille-notify@.service"), "[Service]\nExecStart=/bin/true\n")
+
+    def test_missing_notify_send_saves_nothing(self):
+        shutil.which = lambda n, **k: None if n == "notify-send" else self._which(n, **k)
+        t = task(adv=adv(fail=rv.NOTIFY_UNIT))
+        with self.assertRaises(ValueError) as cm: rv.apply_task(t)
+        self.assertIn("notify-send", str(cm.exception))
+        self.assertFalse(os.path.exists(f"{rv.UNITS}/{t['unit']}.service"))
+
+    def test_other_choices_do_not_create_it(self):
+        self.assertIsNone(rv.apply_task(task(adv=adv(fail="other.service"))))
+        self.assertFalse(os.path.exists(f"{rv.UNITS}/reveille-notify@.service"))
+
+
 class UniqueBase(Base):
     def test_given_set_is_not_refetched_and_grows(self):
         taken = set()

@@ -58,10 +58,24 @@ def unit_texts(t, old_service="", old_timer=""):
         "Install": ({"WantedBy"}, ["WantedBy=timers.target"], lambda k, v: v != "timers.target")})
     return service, timer
 
+def ensure_notify_helper():
+    """Create ~/.config/systemd/user/reveille-notify@.service (a template: the instance is the failed unit) unless it
+    is there already, so a user's own edits stay. Raises ValueError if notify-send is missing; returns None."""
+    path = f"{UNITS}/reveille-notify@.service"
+    if os.path.exists(path): return
+    tool = shutil.which("notify-send")
+    if not tool: raise ValueError("notify-send was not found (install libnotify) for the notification")
+    os.makedirs(UNITS, exist_ok=True)
+    write_atomic(path, "[Unit]\nDescription=Notify that %I failed (created by reveille)\n\n[Service]\nType=oneshot\n"
+                       f"ExecStart={xesc(shlex.quote(tool))} --urgency=critical --app-name=reveille 'Task failed' %I\n")
+
 def apply_task(t):
     """Write the units for a task and (de)activate its timer. Returns an error text or None."""
     base = f"{UNITS}/{t['unit']}"
     service, timer = unit_texts(t, read_text(base + ".service"), read_text(base + ".timer"))
+    if service is not None and t.get("adv", {}).get("fail") == NOTIFY_UNIT:
+        try: ensure_notify_helper()
+        except OSError as e: raise ValueError(f"Could not create the notification helper: {e.strerror or e}")
     undo = []                                  # how to put each file back if a later write fails
     try:
         os.makedirs(UNITS, exist_ok=True)

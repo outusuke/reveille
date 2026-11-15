@@ -127,8 +127,8 @@ def gui():
             self.path = Adw.EntryRow(title="Only if this path exists (start with ! to require it missing)",
                                      text=adv.get("path", ""))
             others = [x for x in found if x != (m or {}).get("service")]
-            def picker(title, subtitle, cur):              # "None" plus the services; a current value that isn't listed stays
-                items, sel = pick_list(others, cur)
+            def picker(title, subtitle, cur, extra=()):    # "None" plus the services; a current value that isn't listed stays
+                items, sel = pick_list(list(extra) + others, cur)
                 row = Adw.ComboRow(title=title, subtitle=subtitle, enable_search=True,
                                    model=Gtk.StringList.new(["None"] + items))
                 row.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
@@ -136,8 +136,9 @@ def gui():
                 return row, [""] + items
             self.then, self.then_opts = picker("Then run", "A service to start after this one succeeds", adv.get("then", ""))
             self.fail, self.fail_opts = picker("If it fails, run",
-                                               "A service to start when this one fails (after the last retry, if any)",
-                                               adv.get("fail", ""))
+                                               "A service to start when this one fails (after the last retry, if any); "
+                                               f"{NOTIFY_UNIT} shows a notification",
+                                               adv.get("fail", ""), (NOTIFY_UNIT,))
             if sd is not None and sd < 244:
                 self.retries.set_sensitive(False); self.retries.set_subtitle(f"Needs systemd 244 or newer (this is {sd})")
             if sd is not None and sd < 249:
