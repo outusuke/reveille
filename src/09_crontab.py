@@ -146,6 +146,10 @@ def crontab_plan(text, known=None):
                                                    "(use 'If it fails, run' to get notified)")
         if env.get("CRON_TZ"): it["general"].append("CRON_TZ is not applied: times follow the system time zone")
         cmd = cron_task_command(e["command"], shell)
+        words = shlex.split(cmd)
+        if words and not os.path.isabs(words[0]):          # cron looks a command up in the crontab's own PATH, not ours
+            found = shutil.which(words[0], path=env.get("PATH"))
+            if found: cmd = shlex.join([found] + words[1:])
         t = {"name": cron_name(e, e["command"]), "kind": "command", "command": cmd, "trigger": tr, "catchup": False,
              "enabled": True, "adv": {"delay": 0, "env": " ".join(shlex.quote(f"{k}={v}") for k, v in env.items()
                                                                    if k not in CRON_NO_ENV)}}

@@ -1507,6 +1507,17 @@ junk
     def plan(self, text=None):
         return rv.crontab_plan(self.SAMPLE if text is None else text)
 
+    def test_command_is_looked_up_in_the_crontabs_own_path(self):
+        d = tempfile.mkdtemp(); tool = f"{d}/only-in-cron-path"
+        with open(tool, "w") as f: f.write("#!/bin/sh\n")
+        os.chmod(tool, 0o755)
+        try:
+            it = self.plan(f"PATH={d}\n0 4 * * * only-in-cron-path\n")[0]
+            self.assertEqual((it["status"], it["task"]["command"]), ("new", tool))
+            self.assertIn(f"ExecStart={tool}", rv.unit_texts({**it["task"], "unit": "x"})[0])     # applying works too
+            self.assertEqual(self.plan("0 4 * * * only-in-cron-path\n")[0]["status"], "skip")   # no PATH line: not found
+        finally: shutil.rmtree(d)
+
     def test_parse_keeps_env_hints_and_skips_comments(self):
         es = rv.parse_crontab(self.SAMPLE)
         self.assertEqual([e["line"] for e in es], [7, 8, 9, 10, 11, 12, 13])
