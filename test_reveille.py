@@ -791,6 +791,36 @@ class CommandLine(Base):
         self.assertEqual(got, [("nightly.service", 5), ("nightly.service", 200)])
         self.assertEqual(self.run_main("logs", "nope")[0], 1)
 
+    def new(self, *argv):
+        self._bad = rv.bad_calendar; rv.bad_calendar = lambda e: False          # no systemd-analyze needed
+        try: return self.run_main("new", "Nightly", "--command", "/bin/true", *argv)
+        finally: rv.bad_calendar = self._bad
+
+    def test_new_task_schedules(self):
+        cases = [(["--at", "09:30"], "OnCalendar=*-*-* 09:30:00"),
+                 (["--at", "08:00,12:30"], "OnCalendar=*-*-* 12:30:00"),
+                 (["--at", "07:00", "--days", "Mon..Fri"], "OnCalendar=Mon,Tue,Wed,Thu,Fri *-*-* 07:00:00"),
+                 (["--every", "15min"], "OnUnitActiveSec=15min"),
+                 (["--calendar", "Sun 04:00"], "OnCalendar=Sun *-*-* 04:00:00"),
+                 (["--login"], "OnStartupSec=10s")]
+        for argv, line in cases:
+            shutil.rmtree(f"{TMP}/systemd", ignore_errors=True)
+            code, out, err = self.new(*argv)
+            self.assertEqual((code, err), (0, ""), argv); self.assertIn("Created nightly.timer", out)
+            self.assertIn(line, read(f"{rv.UNITS}/nightly.timer"), argv)
+            self.assertIn("ExecStart=/bin/true", read(f"{rv.UNITS}/nightly.service"))
+            self.assertIn(("enable", "--now", "nightly.timer"), CALLS)
+
+    def test_new_task_disabled_and_errors(self):
+        code, out, _ = self.new("--at", "09:00", "--disabled")
+        self.assertEqual(code, 0); self.assertIn("switched off", out); self.assertIn(("disable", "--now", "nightly.timer"), CALLS)
+        for argv in (["--at", "25:00"], ["--every", "1.5s"], ["--at", "08:00,09:00", "--days", "Mon"], ["--at", "08:00", "--days", "Funday"]):
+            code, _, err = self.new(*argv); self.assertEqual(code, 1, argv); self.assertTrue(err, argv)
+        self.assertEqual(self.new()[0], 2)                                   # a schedule option is required
+        self.assertEqual(self.run_main("new", "X", "--at", "09:00")[0], 2)    # so is --command
+        code, _, err = self.run_main("new", "X", "--command", "no-such-cmd-xyz", "--at", "09:00")
+        self.assertEqual(code, 1); self.assertIn("not found", err)
+
     def test_list_json(self):
         import json
         rv.gather = lambda: {"tasks": [], "free": []}

@@ -23,6 +23,7 @@ systemd is the only store. Every task is a plain `.timer` (plus a `.service` for
     ./reveille list --json  the same as JSON, for scripts
     ./reveille enable NAME  turn a task's timer on (disable NAME turns it off)
     ./reveille logs NAME    print the last 200 lines of its journal (-n N for another count)
+    ./reveille new NAME --command CMD --at 09:00   create a task (or --every 15min, --calendar EXPR, --login; --days, --disabled)
     ./reveille run NAME     run a task or service now (task name or unit name)
     ./reveille import-cron  preview turning your crontab into tasks (add --apply to create them)
     ./reveille --version    print the version (--help lists all commands)

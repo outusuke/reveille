@@ -64,6 +64,38 @@ def cmd_logs(name, lines):
     print(text)
     return 0
 
+def schedule_from_args(a):
+    """(trigger, None) from the `new` options, or (None, error text)."""
+    if a.login: return {"type": "login", "login_sec": 10}, None
+    if a.every:
+        secs = exact_span(a.every); step = split_interval(secs) if secs else None
+        if not step: return None, f"--every {a.every!r} is not a time span the editor can show (try 15min, 2h, 1d)"
+        return {"type": "interval", "every": step[0], "unit": step[1]}, None
+    if a.calendar: return from_calendar(a.calendar), None
+    times = parse_times(a.at or "")
+    if not times: return None, "--at needs clock times like 09:00 or 08:00,12:30"
+    if a.days:
+        days = parse_days(a.days)
+        if not days or len(times) > 1: return None, "--days takes days like Mon,Wed or Mon..Fri, and only one --at time"
+        return from_calendar(f"{a.days} {times[0]}"), None
+    return ({"type": "times", "times": times} if len(times) > 1 else from_calendar(times[0])), None
+
+def cmd_new(a):
+    """Create a command task from the command line, the way the editor would."""
+    tr, err = schedule_from_args(a)
+    cal = on_calendar(tr) if tr else None
+    if not err and cal and bad_calendar(cal): err = f"systemd rejected the schedule {cal!r}"
+    if err: print(err, file=sys.stderr); return 1
+    t = {"name": a.name, "kind": "command", "command": a.command, "trigger": {**DEFAULT_TR, **tr}, "catchup": True,
+         "enabled": not a.disabled, "adv": {}}
+    try:
+        t["unit"] = unique_base(a.name)
+        err = apply_task(t)
+    except ValueError as x: err = str(x)
+    if err: print(err, file=sys.stderr); return 1
+    print(f"Created {t['unit']}.timer: {describe(t['trigger'])}" + (" (switched off)" if a.disabled else ""))
+    return 0
+
 def cmd_import_cron(path, apply, disabled):
     """Preview, or with --apply create, tasks from a crontab. The crontab itself is never changed."""
     text, err = read_crontab(path)
@@ -116,6 +148,16 @@ def build_parser():
     lg = sub.add_parser("logs", help="print the last lines of a task's journal")
     lg.add_argument("name", help="task name or unit name, as shown by 'list'")
     lg.add_argument("-n", "--lines", type=int, default=200, metavar="N", help="how many lines (default 200)")
+    nw = sub.add_parser("new", help="create a command task")
+    nw.add_argument("name", help="the task's name")
+    nw.add_argument("--command", required=True, help="the command to run (use sh -c '...' for pipes)")
+    when = nw.add_mutually_exclusive_group(required=True)
+    when.add_argument("--at", metavar="TIMES", help="every day at 09:00 (or several: 08:00,12:30)")
+    when.add_argument("--every", metavar="SPAN", help="at an interval, such as 15min, 2h or 1d")
+    when.add_argument("--calendar", metavar="EXPR", help="a systemd calendar expression, such as 'Mon..Fri 09:00'")
+    when.add_argument("--login", action="store_true", help="shortly after login")
+    nw.add_argument("--days", metavar="DAYS", help="with --at: only these days (Mon,Wed or Mon..Fri)")
+    nw.add_argument("--disabled", action="store_true", help="create the timer switched off")
     c = sub.add_parser("import-cron", help="turn crontab entries into tasks (preview unless --apply)")
     c.add_argument("--file", metavar="FILE", help="read this crontab file instead of 'crontab -l' (- for standard input)")
     c.add_argument("--apply", action="store_true", help="create the tasks (the default only shows what would happen)")
@@ -129,6 +171,7 @@ def main(argv=None):
     if args.cmd == "run": return cmd_run(args.name)
     if args.cmd in ("enable", "disable"): return cmd_switch(args.name, args.cmd == "enable")
     if args.cmd == "logs": return cmd_logs(args.name, args.lines)
+    if args.cmd == "new": return cmd_new(args)
     if args.cmd == "import-cron": return cmd_import_cron(args.file, args.apply, args.disabled)
     if args.cmd in ("install", "uninstall"): return cmd_menu(args.cmd == "install")
     return cmd_gui()
