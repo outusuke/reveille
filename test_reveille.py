@@ -811,6 +811,14 @@ class CommandLine(Base):
             self.assertIn("ExecStart=/bin/true", read(f"{rv.UNITS}/nightly.service"))
             self.assertIn(("enable", "--now", "nightly.timer"), CALLS)
 
+    def test_new_task_dry_run_writes_nothing(self):
+        code, out, _ = self.new("--at", "09:30", "--dry-run")
+        self.assertEqual(code, 0)
+        for text in ("nightly.service", "ExecStart=/bin/true", "nightly.timer", "OnCalendar=*-*-* 09:30:00"): self.assertIn(text, out)
+        self.assertFalse(os.path.exists(f"{rv.UNITS}/nightly.timer")); self.assertFalse([c for c in CALLS if c[0] in ("enable", "disable", "daemon-reload", "start", "stop")])
+        code, _, err = self.run_main("new", "X", "--command", "no-such-cmd-xyz", "--at", "09:00", "--dry-run")
+        self.assertEqual(code, 1); self.assertIn("not found", err)
+
     def test_new_task_disabled_and_errors(self):
         code, out, _ = self.new("--at", "09:00", "--disabled")
         self.assertEqual(code, 0); self.assertIn("switched off", out); self.assertIn(("disable", "--now", "nightly.timer"), CALLS)
