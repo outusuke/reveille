@@ -35,10 +35,16 @@ def unit_texts(t, old_service="", old_timer=""):
         if adv.get("timeout"): svc.append(f"TimeoutStartSec={int(adv['timeout'])}min")
         if retries: svc += ["Restart=on-failure", f"RestartSec={wait}min"]
         if low: svc += ["Nice=19", "IOSchedulingClass=idle"]
+        cond = (adv.get("condition") or "").strip()
+        old_conds = [xunesc(joined(g).split("=", 1)[1].strip()) for g in groups(old_service)
+                     if joined(g).strip().startswith("ExecCondition=")]
+        keep_cond = bool(cond) and old_conds == [cond]        # unchanged: leave the line as the user wrote it
+        if cond and not keep_cond: svc.append(f"ExecCondition={exec_words(cond)}")
         if adv.get("online"): svc.append(f"ExecStartPre={WAIT_NET}")
         if t["kind"] == "app": svc.append("KillMode=process")    # the launcher exits at once: don't kill the app it started
         if not keep_exec: svc.append(f"ExecStart={build_exec(t)}")
         def keep_svc(k, v):                # a Nice= or IOSchedulingClass= that isn't the low-priority preset stays
+            if k == "ExecCondition": return keep_cond or "condition" not in adv   # no "condition" given: not ours to touch
             if k == "ExecStartPre": return v != WAIT_NET             # the user's own ExecStartPre= lines stay
             return not low and ((k == "Nice" and v != "19") or (k == "IOSchedulingClass" and v != "idle"))
         def keep_unit(k, v):               # keep dependencies and conditions that aren't ours

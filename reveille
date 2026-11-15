@@ -43,7 +43,7 @@ TIMER_KEYS = set(SCHEDULE_KEYS) | {"AccuracySec"}              # what a save of 
 # Settings the editor manages in the service. A drop-in that sets one of them makes what the editor shows untrue.
 UNIT_KEYS = {"ConditionACPower", "Wants", "After", "ConditionPathExists", "OnSuccess", "OnFailure",
              "StartLimitIntervalSec", "StartLimitBurst"}
-SERVICE_KEYS = {"ExecStartPre", "WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice", "IOSchedulingClass"}
+SERVICE_KEYS = {"ExecCondition", "ExecStartPre", "WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice", "IOSchedulingClass"}
 SERVICE_DROPIN_KEYS = {"Unit": UNIT_KEYS, "Service": SERVICE_KEYS | {"ExecStart", "KillMode"}}
 TIMER_DROPIN_KEYS = {"Timer": set(SCHEDULE_KEYS) | {"Unit"}, "Unit": {"Description"}}
 NOTIFY_UNIT = "reveille-notify@%n.service"   # an "If it fails, run" choice: a desktop notification naming the failed unit
@@ -494,14 +494,19 @@ def build_exec(t):
         if gio: tokens = [gio, "launch", path]
         elif gtk: tokens = [gtk, t["app"]]
         else: raise ValueError("Neither gio nor gtk-launch was found")
-    else:
-        tokens = shlex.split(t["command"])
-        if not tokens: raise ValueError("Enter a valid command")
-        tokens = [os.path.expanduser(x) if x.startswith("~") else x for x in tokens]   # a shell would; ExecStart= doesn't
-        if not os.path.isabs(tokens[0]):
-            found = shutil.which(tokens[0])
-            if not found: raise ValueError(f"{tokens[0]} was not found in PATH")
-            tokens[0] = found
+        return " ".join(xesc(shlex.quote(x)) for x in tokens)
+    return exec_words(t["command"])
+
+def exec_words(command):
+    """A command typed by the user as the value of an Exec*= line: words split like a shell would, ~ expanded,
+    the program looked up in PATH. Raises ValueError with a readable reason."""
+    tokens = shlex.split(command)
+    if not tokens: raise ValueError("Enter a valid command")
+    tokens = [os.path.expanduser(x) if x.startswith("~") else x for x in tokens]   # a shell would; ExecStart= doesn't
+    if not os.path.isabs(tokens[0]):
+        found = shutil.which(tokens[0])
+        if not found: raise ValueError(f"{tokens[0]} was not found in PATH")
+        tokens[0] = found
     return " ".join(xesc(shlex.quote(x)) for x in tokens)
 
 def parse_service(name):
@@ -536,6 +541,13 @@ def parse_service(name):
         m = re.fullmatch(r"([1-9]\d*)min", (sv.get("RestartSec") or [""])[-1])
         if not m or int(m[1]) > 1440: return {"why": "RestartSec= isn't a whole number of minutes (1 to 1440)"}
         wait = int(m[1])
+    conds = sv.get("ExecCondition", [])
+    if len(conds) > 1: return {"why": "there are several ExecCondition= lines"}
+    cond = xunesc(conds[0]) if conds else ""
+    if conds and (not cond or cond[0] in "-@:+!|"): return {"why": "ExecCondition= starts with a special prefix (- @ + ! :)"}
+    if conds:
+        try: shlex.split(cond)
+        except ValueError: return {"why": "ExecCondition= can't be split into words"}
     paths = un.get("ConditionPathExists", [])
     if len(paths) > 1: return {"why": "there are several ConditionPathExists= lines"}
     then = [x for v in un.get("OnSuccess", []) for x in v.split()]
@@ -546,7 +558,7 @@ def parse_service(name):
            "timeout": timeout, "ac": "true" in un.get("ConditionACPower", []), "online": ONLINE in deps or WAIT_NET in sv.get("ExecStartPre", []),
            "retries": retries, "retry_wait": wait,
            "low": sv.get("Nice") == ["19"] and sv.get("IOSchedulingClass") == ["idle"],
-           "path": unesc(paths[0]) if paths else "", "then": then[0] if then else "",
+           "path": unesc(paths[0]) if paths else "", "condition": cond, "then": then[0] if then else "",
            "fail": fail[0] if fail else ""}
     s = {"adv": adv, "kind": "command", "command": cmd}
     if len(tokens) == 3 and os.path.basename(tokens[0]) == "gio" and tokens[1] == "launch":
@@ -709,10 +721,16 @@ def unit_texts(t, old_service="", old_timer=""):
         if adv.get("timeout"): svc.append(f"TimeoutStartSec={int(adv['timeout'])}min")
         if retries: svc += ["Restart=on-failure", f"RestartSec={wait}min"]
         if low: svc += ["Nice=19", "IOSchedulingClass=idle"]
+        cond = (adv.get("condition") or "").strip()
+        old_conds = [xunesc(joined(g).split("=", 1)[1].strip()) for g in groups(old_service)
+                     if joined(g).strip().startswith("ExecCondition=")]
+        keep_cond = bool(cond) and old_conds == [cond]        # unchanged: leave the line as the user wrote it
+        if cond and not keep_cond: svc.append(f"ExecCondition={exec_words(cond)}")
         if adv.get("online"): svc.append(f"ExecStartPre={WAIT_NET}")
         if t["kind"] == "app": svc.append("KillMode=process")    # the launcher exits at once: don't kill the app it started
         if not keep_exec: svc.append(f"ExecStart={build_exec(t)}")
         def keep_svc(k, v):                # a Nice= or IOSchedulingClass= that isn't the low-priority preset stays
+            if k == "ExecCondition": return keep_cond or "condition" not in adv   # no "condition" given: not ours to touch
             if k == "ExecStartPre": return v != WAIT_NET             # the user's own ExecStartPre= lines stay
             return not low and ((k == "Nice" and v != "19") or (k == "IOSchedulingClass" and v != "idle"))
         def keep_unit(k, v):               # keep dependencies and conditions that aren't ours
@@ -1389,6 +1407,11 @@ def gui():
                                      subtitle="Lowest CPU and disk priority, so it doesn't slow down your work")
             self.path = Adw.EntryRow(title="Only if this path exists (start with ! to require it missing)",
                                      text=adv.get("path", ""))
+            self.cond = Adw.EntryRow(title="Only if this command succeeds (exit 1 to 254 skips the run)",
+                                     text=adv.get("condition", ""))
+            if sd is not None and sd < 243:
+                self.cond.set_sensitive(False)
+                self.cond.set_title(f"Only if this command succeeds (needs systemd 243 or newer, this is {sd})")
             others = [x for x in found if x != (m or {}).get("service")]
             def picker(title, subtitle, cur, extra=()):    # "None" plus the services; a current value that isn't listed stays
                 items, sel = pick_list(list(extra) + others, cur)
@@ -1407,7 +1430,7 @@ def gui():
             if sd is not None and sd < 249:
                 self.then.set_sensitive(False); self.then.set_subtitle(f"Needs systemd 249 or newer (this is {sd})")
             self.own_only = [self.cwd, self.env, self.timeout, self.ac, self.online, self.retries, self.retry_wait,
-                             self.low, self.path, self.then, self.fail]   # don't apply to an existing service
+                             self.low, self.path, self.cond, self.then, self.fail]   # don't apply to an existing service
             for r in self.own_only + [self.delay, self.wake]: g.add(r)
 
             # Delete lives inside the item: a task's timer, or a service without a timer opened via its row
@@ -1509,6 +1532,7 @@ def gui():
                          "wake": self.wake.get_active(),
                          "retries": int(self.retries.get_value()), "retry_wait": int(self.retry_wait.get_value()),
                          "low": self.low.get_active(), "path": self.path.get_text().strip(),
+                         "condition": self.cond.get_text().strip(),
                          "then": self.then_opts[self.then.get_selected()],
                          "fail": self.fail_opts[self.fail.get_selected()]}}
             if k == 0:
@@ -2103,7 +2127,7 @@ def cmd_new(a):
     if not err and cal and bad_calendar(cal): err = f"systemd rejected the schedule {cal!r}"
     if err: print(err, file=sys.stderr); return 1
     t = {"name": a.name, "kind": "command", "command": a.command, "trigger": {**DEFAULT_TR, **tr}, "catchup": True,
-         "enabled": not a.disabled, "adv": {"wake": a.wake}}
+         "enabled": not a.disabled, "adv": {"wake": a.wake, "condition": a.only_if or ""}}
     try:
         t["unit"] = unique_base(a.name)
         if a.dry_run:                                   # show exactly what would be written, write nothing
@@ -2177,6 +2201,7 @@ def build_parser():
     when.add_argument("--calendar", metavar="EXPR", help="a systemd calendar expression, such as 'Mon..Fri 09:00'")
     when.add_argument("--login", action="store_true", help="shortly after login")
     nw.add_argument("--days", metavar="DAYS", help="with --at: only these days (Mon,Wed or Mon..Fri)")
+    nw.add_argument("--only-if", metavar="CMD", help="run only if this command succeeds (ExecCondition=); exit 1 to 254 skips the run quietly")
     nw.add_argument("--disabled", action="store_true", help="create the timer switched off")
     nw.add_argument("--wake", action="store_true", help="wake the computer from suspend when the timer is due (WakeSystem=true)")
     nw.add_argument("--dry-run", action="store_true", help="print the unit files that would be written and change nothing")

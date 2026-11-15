@@ -57,7 +57,7 @@ class RoundTrip(Base):
         self.assertEqual(m["trigger"]["days"], ["Mon", "Fri"])
         self.assertEqual((m["trigger"]["hour"], m["trigger"]["minute"]), (7, 30))
         self.assertEqual(m["adv"], {"cwd": "/tmp", "env": "A=1 'B=x y'", "timeout": 5, "ac": True,
-                                    "online": True, "delay": 60, "wake": False, "retries": 0, "retry_wait": 5, "low": False, "path": "", "then": "", "fail": ""})
+                                    "online": True, "delay": 60, "wake": False, "retries": 0, "retry_wait": 5, "low": False, "path": "", "condition": "", "then": "", "fail": ""})
         self.assertIn("echo $HOME | cat", m["command"])
 
     def test_percent_and_dollar_are_escaped_in_the_files(self):
@@ -188,7 +188,8 @@ class Editable(Base):
             self.assertIn(line, svc)
         write("x.service", svc)
         s2 = rv.parse_service("x.service")
-        self.assertEqual(s2["adv"], {"cwd": "/tmp", "env": "A=1", "timeout": 5, "ac": True, "online": True, "retries": 0, "retry_wait": 5, "low": False, "path": "", "then": "", "fail": ""})
+        self.assertEqual(s2["adv"], {"cwd": "/tmp", "env": "A=1", "timeout": 5, "ac": True, "online": True, "retries": 0, "retry_wait": 5, "low": False, "path": "",
+                                   "condition": "/bin/sh -c 'nmcli -g METERED general status | grep -qv \"yes\"'", "then": "", "fail": ""})
         svc3, _ = self.save(m, adv={"cwd": "", "env": "", "timeout": 0, "ac": False, "online": False, "delay": 0})
         self.assertEqual(svc3, GPODDER_SERVICE)
 
@@ -1083,6 +1084,58 @@ class Reliability(Base):
             m, svc = self.roundtrip(path=path)
             self.assertEqual(m["adv"]["path"], path)
         self.assertIn("ConditionPathExists=/srv/100%%", svc)            # % is escaped in the file
+
+    def test_exec_condition_round_trip_and_clearing(self):
+        m, svc = self.roundtrip(condition="/usr/bin/test -f /tmp/go")
+        self.assertIn("ExecCondition=/usr/bin/test -f /tmp/go\n", svc)
+        self.assertTrue(m["full"]); self.assertEqual(m["adv"]["condition"], "/usr/bin/test -f /tmp/go")
+        self.assertLess(svc.index("ExecCondition="), svc.index("ExecStart="))
+        self.assertNotIn("ExecCondition", self.roundtrip(condition="")[1])
+
+    def test_exec_condition_quotes_percent_and_dollar_round_trip(self):
+        cond = "/bin/sh -c 'test \"$HOME\" != /x && date +%H | grep -q 0'"
+        m, svc = self.roundtrip(condition=cond)
+        self.assertIn("$$HOME", svc); self.assertIn("+%%H", svc)             # $ and % are special in unit files
+        self.assertEqual(m["adv"]["condition"], cond)
+
+    def test_exec_condition_is_looked_up_in_path_and_refused_when_missing(self):
+        m, svc = self.roundtrip(condition="true")
+        self.assertRegex(svc, r"ExecCondition=/\S*/true\n")
+        with self.assertRaises(ValueError): rv.unit_texts(task(adv=adv(condition="no-such-program-xyz")))
+
+    def test_unchanged_exec_condition_is_kept_exactly_as_written(self):
+        svc = SIMPLE_SERVICE + "ExecCondition=/bin/sh -c  \"test -f /a\"\n"   # double quotes, two spaces: not what we'd write
+        write("x.service", svc); write("x.timer", SIMPLE_TIMER)
+        m = rv.load_task("x.timer"); self.assertTrue(m["full"])
+        self.assertEqual(m["adv"]["condition"], '/bin/sh -c  "test -f /a"')
+        out, _ = rv.unit_texts({"name": "x", "kind": "command", "command": "/usr/bin/true", "trigger": rv.DEFAULT_TR,
+                                "service": "x.service", "unit": "x", "old_name": "x", "keep_exec": True,
+                                "adv": adv(condition=m["adv"]["condition"])}, svc, SIMPLE_TIMER)
+        self.assertEqual(out, svc)
+
+    def test_exec_condition_replaced_not_duplicated(self):
+        svc = SIMPLE_SERVICE + "ExecCondition=/usr/bin/false\n"
+        write("x.service", svc); write("x.timer", SIMPLE_TIMER)
+        base = {"name": "x", "kind": "command", "command": "/usr/bin/true", "trigger": rv.DEFAULT_TR,
+                "service": "x.service", "unit": "x", "old_name": "x", "keep_exec": True}
+        out, _ = rv.unit_texts({**base, "adv": adv(condition="/usr/bin/test -d /tmp")}, svc, SIMPLE_TIMER)
+        self.assertEqual(out.count("ExecCondition="), 1); self.assertIn("ExecCondition=/usr/bin/test -d /tmp", out)
+        out, _ = rv.unit_texts({**base, "adv": adv()}, svc, SIMPLE_TIMER)         # key absent: not ours to touch
+        self.assertIn("ExecCondition=/usr/bin/false", out)
+        out, _ = rv.unit_texts({**base, "adv": adv(condition="")}, svc, SIMPLE_TIMER)
+        self.assertNotIn("ExecCondition", out)
+
+    def test_exec_condition_forms_the_editor_cannot_show_limit_the_task(self):
+        for extra, word in (("ExecCondition=/usr/bin/true\nExecCondition=/usr/bin/false\n", "several"),
+                            ("ExecCondition=-/usr/bin/true\n", "special prefix")):
+            write("x.service", SIMPLE_SERVICE + extra); write("x.timer", SIMPLE_TIMER)
+            m = rv.load_task("x.timer"); self.assertFalse(m["full"]); self.assertIn(word, m["why"])
+
+    def test_exec_condition_in_a_drop_in_limits_the_task(self):
+        write("x.service", SIMPLE_SERVICE); write("x.timer", SIMPLE_TIMER)
+        os.makedirs(f"{rv.UNITS}/x.service.d", exist_ok=True)
+        write("x.service.d/o.conf", "[Service]\nExecCondition=/usr/bin/false\n")
+        m = rv.load_task("x.timer"); self.assertFalse(m["full"]); self.assertIn("ExecCondition=", m["why"])
 
     def test_then_run_round_trip_and_clearing(self):
         m, svc = self.roundtrip(then="upload.service")

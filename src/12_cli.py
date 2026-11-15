@@ -87,7 +87,7 @@ def cmd_new(a):
     if not err and cal and bad_calendar(cal): err = f"systemd rejected the schedule {cal!r}"
     if err: print(err, file=sys.stderr); return 1
     t = {"name": a.name, "kind": "command", "command": a.command, "trigger": {**DEFAULT_TR, **tr}, "catchup": True,
-         "enabled": not a.disabled, "adv": {"wake": a.wake}}
+         "enabled": not a.disabled, "adv": {"wake": a.wake, "condition": a.only_if or ""}}
     try:
         t["unit"] = unique_base(a.name)
         if a.dry_run:                                   # show exactly what would be written, write nothing
@@ -161,6 +161,7 @@ def build_parser():
     when.add_argument("--calendar", metavar="EXPR", help="a systemd calendar expression, such as 'Mon..Fri 09:00'")
     when.add_argument("--login", action="store_true", help="shortly after login")
     nw.add_argument("--days", metavar="DAYS", help="with --at: only these days (Mon,Wed or Mon..Fri)")
+    nw.add_argument("--only-if", metavar="CMD", help="run only if this command succeeds (ExecCondition=); exit 1 to 254 skips the run quietly")
     nw.add_argument("--disabled", action="store_true", help="create the timer switched off")
     nw.add_argument("--wake", action="store_true", help="wake the computer from suspend when the timer is due (WakeSystem=true)")
     nw.add_argument("--dry-run", action="store_true", help="print the unit files that would be written and change nothing")

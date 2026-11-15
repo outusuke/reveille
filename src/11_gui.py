@@ -133,6 +133,11 @@ def gui():
                                      subtitle="Lowest CPU and disk priority, so it doesn't slow down your work")
             self.path = Adw.EntryRow(title="Only if this path exists (start with ! to require it missing)",
                                      text=adv.get("path", ""))
+            self.cond = Adw.EntryRow(title="Only if this command succeeds (exit 1 to 254 skips the run)",
+                                     text=adv.get("condition", ""))
+            if sd is not None and sd < 243:
+                self.cond.set_sensitive(False)
+                self.cond.set_title(f"Only if this command succeeds (needs systemd 243 or newer, this is {sd})")
             others = [x for x in found if x != (m or {}).get("service")]
             def picker(title, subtitle, cur, extra=()):    # "None" plus the services; a current value that isn't listed stays
                 items, sel = pick_list(list(extra) + others, cur)
@@ -151,7 +156,7 @@ def gui():
             if sd is not None and sd < 249:
                 self.then.set_sensitive(False); self.then.set_subtitle(f"Needs systemd 249 or newer (this is {sd})")
             self.own_only = [self.cwd, self.env, self.timeout, self.ac, self.online, self.retries, self.retry_wait,
-                             self.low, self.path, self.then, self.fail]   # don't apply to an existing service
+                             self.low, self.path, self.cond, self.then, self.fail]   # don't apply to an existing service
             for r in self.own_only + [self.delay, self.wake]: g.add(r)
 
             # Delete lives inside the item: a task's timer, or a service without a timer opened via its row
@@ -253,6 +258,7 @@ def gui():
                          "wake": self.wake.get_active(),
                          "retries": int(self.retries.get_value()), "retry_wait": int(self.retry_wait.get_value()),
                          "low": self.low.get_active(), "path": self.path.get_text().strip(),
+                         "condition": self.cond.get_text().strip(),
                          "then": self.then_opts[self.then.get_selected()],
                          "fail": self.fail_opts[self.fail.get_selected()]}}
             if k == 0:

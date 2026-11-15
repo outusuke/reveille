@@ -11,14 +11,19 @@ def build_exec(t):
         if gio: tokens = [gio, "launch", path]
         elif gtk: tokens = [gtk, t["app"]]
         else: raise ValueError("Neither gio nor gtk-launch was found")
-    else:
-        tokens = shlex.split(t["command"])
-        if not tokens: raise ValueError("Enter a valid command")
-        tokens = [os.path.expanduser(x) if x.startswith("~") else x for x in tokens]   # a shell would; ExecStart= doesn't
-        if not os.path.isabs(tokens[0]):
-            found = shutil.which(tokens[0])
-            if not found: raise ValueError(f"{tokens[0]} was not found in PATH")
-            tokens[0] = found
+        return " ".join(xesc(shlex.quote(x)) for x in tokens)
+    return exec_words(t["command"])
+
+def exec_words(command):
+    """A command typed by the user as the value of an Exec*= line: words split like a shell would, ~ expanded,
+    the program looked up in PATH. Raises ValueError with a readable reason."""
+    tokens = shlex.split(command)
+    if not tokens: raise ValueError("Enter a valid command")
+    tokens = [os.path.expanduser(x) if x.startswith("~") else x for x in tokens]   # a shell would; ExecStart= doesn't
+    if not os.path.isabs(tokens[0]):
+        found = shutil.which(tokens[0])
+        if not found: raise ValueError(f"{tokens[0]} was not found in PATH")
+        tokens[0] = found
     return " ".join(xesc(shlex.quote(x)) for x in tokens)
 
 def parse_service(name):
@@ -53,6 +58,13 @@ def parse_service(name):
         m = re.fullmatch(r"([1-9]\d*)min", (sv.get("RestartSec") or [""])[-1])
         if not m or int(m[1]) > 1440: return {"why": "RestartSec= isn't a whole number of minutes (1 to 1440)"}
         wait = int(m[1])
+    conds = sv.get("ExecCondition", [])
+    if len(conds) > 1: return {"why": "there are several ExecCondition= lines"}
+    cond = xunesc(conds[0]) if conds else ""
+    if conds and (not cond or cond[0] in "-@:+!|"): return {"why": "ExecCondition= starts with a special prefix (- @ + ! :)"}
+    if conds:
+        try: shlex.split(cond)
+        except ValueError: return {"why": "ExecCondition= can't be split into words"}
     paths = un.get("ConditionPathExists", [])
     if len(paths) > 1: return {"why": "there are several ConditionPathExists= lines"}
     then = [x for v in un.get("OnSuccess", []) for x in v.split()]
@@ -63,7 +75,7 @@ def parse_service(name):
            "timeout": timeout, "ac": "true" in un.get("ConditionACPower", []), "online": ONLINE in deps or WAIT_NET in sv.get("ExecStartPre", []),
            "retries": retries, "retry_wait": wait,
            "low": sv.get("Nice") == ["19"] and sv.get("IOSchedulingClass") == ["idle"],
-           "path": unesc(paths[0]) if paths else "", "then": then[0] if then else "",
+           "path": unesc(paths[0]) if paths else "", "condition": cond, "then": then[0] if then else "",
            "fail": fail[0] if fail else ""}
     s = {"adv": adv, "kind": "command", "command": cmd}
     if len(tokens) == 3 and os.path.basename(tokens[0]) == "gio" and tokens[1] == "launch":

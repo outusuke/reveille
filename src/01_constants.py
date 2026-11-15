@@ -27,7 +27,7 @@ TIMER_KEYS = set(SCHEDULE_KEYS) | {"AccuracySec"}              # what a save of 
 # Settings the editor manages in the service. A drop-in that sets one of them makes what the editor shows untrue.
 UNIT_KEYS = {"ConditionACPower", "Wants", "After", "ConditionPathExists", "OnSuccess", "OnFailure",
              "StartLimitIntervalSec", "StartLimitBurst"}
-SERVICE_KEYS = {"ExecStartPre", "WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice", "IOSchedulingClass"}
+SERVICE_KEYS = {"ExecCondition", "ExecStartPre", "WorkingDirectory", "Environment", "TimeoutStartSec", "Restart", "RestartSec", "Nice", "IOSchedulingClass"}
 SERVICE_DROPIN_KEYS = {"Unit": UNIT_KEYS, "Service": SERVICE_KEYS | {"ExecStart", "KillMode"}}
 TIMER_DROPIN_KEYS = {"Timer": set(SCHEDULE_KEYS) | {"Unit"}, "Unit": {"Description"}}
 NOTIFY_UNIT = "reveille-notify@%n.service"   # an "If it fails, run" choice: a desktop notification naming the failed unit
