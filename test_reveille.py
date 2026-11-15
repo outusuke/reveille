@@ -826,6 +826,26 @@ class CommandLine(Base):
         code, out, _ = self.run_main("new", "Alarm", "--command", "true", "--at", "06:30", "--dry-run")
         self.assertNotIn("WakeSystem", out)
 
+    def test_new_notify_flag(self):
+        code, out, _ = self.new("--at", "09:00", "--dry-run", "--notify")
+        self.assertEqual(code, 0); self.assertIn(f"OnFailure={rv.NOTIFY_UNIT}", out)
+        code, out, _ = self.new("--at", "09:00", "--dry-run")
+        self.assertEqual(code, 0); self.assertNotIn("OnFailure", out)
+        self.assertFalse(os.path.exists(f"{rv.UNITS}/reveille-notify@.service"))        # a dry run writes nothing
+        which = shutil.which
+        try:
+            shutil.which = lambda n, **k: "/usr/bin/notify-send" if n == "notify-send" else which(n, **k)
+            code, out, err = self.new("--at", "09:00", "--notify")
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn(f"OnFailure={rv.NOTIFY_UNIT}", read(f"{rv.UNITS}/nightly.service"))
+            self.assertIn("notify-send", read(f"{rv.UNITS}/reveille-notify@.service"))
+            shutil.rmtree(f"{TMP}/systemd", ignore_errors=True)
+            shutil.which = lambda n, **k: None if n == "notify-send" else which(n, **k)
+            code, _, err = self.new("--at", "09:00", "--notify")
+            self.assertEqual(code, 1); self.assertIn("notify-send", err)
+            self.assertFalse(os.path.exists(f"{rv.UNITS}/nightly.service"))             # nothing was saved
+        finally: shutil.which = which
+
     def test_new_task_disabled_and_errors(self):
         code, out, _ = self.new("--at", "09:00", "--disabled")
         self.assertEqual(code, 0); self.assertIn("switched off", out); self.assertIn(("disable", "--now", "nightly.timer"), CALLS)
@@ -1017,6 +1037,44 @@ class NotifyOnFailure(Base):
     def test_other_choices_do_not_create_it(self):
         self.assertIsNone(rv.apply_task(task(adv=adv(fail="other.service"))))
         self.assertFalse(os.path.exists(f"{rv.UNITS}/reveille-notify@.service"))
+
+    def test_the_switch_state_is_read_from_the_file(self):
+        # the editor shows the switch on exactly when OnFailure= is NOTIFY_UNIT; any other service is the picker's
+        write("n.service", SIMPLE_SERVICE.replace("[Service]", f"OnFailure={rv.NOTIFY_UNIT}\n[Service]")); write("n.timer", SIMPLE_TIMER)
+        self.assertEqual(rv.load_task("n.timer")["adv"]["fail"], rv.NOTIFY_UNIT)
+        write("o.service", SIMPLE_SERVICE.replace("[Service]", "OnFailure=other.service\n[Service]")); write("o.timer", SIMPLE_TIMER)
+        self.assertEqual(rv.load_task("o.timer")["adv"]["fail"], "other.service")
+
+    def test_switching_it_on_and_off_keeps_the_other_lines(self):
+        svc = SIMPLE_SERVICE.replace("[Service]", "[Service]\n# my note\nExecCondition=/usr/bin/test -d /tmp").replace(
+            "ExecStart=/usr/bin/true", "ExecStart=/usr/bin/true  --flag   'a  b'")
+        write("k.service", svc); write("k.timer", SIMPLE_TIMER)
+        m = rv.load_task("k.timer"); self.assertTrue(m["full"]); self.assertEqual(m["adv"]["fail"], "")
+        def save(fail):
+            t = {k: m[k] for k in ("unit", "name", "kind", "trigger", "catchup", "enabled", "service")}
+            t.update(app=m.get("app"), command=m.get("command"), old_name=m["name"], keep_exec=True, adv={**m["adv"], "fail": fail})
+            self.assertIsNone(rv.apply_task(t)); return read(f"{rv.UNITS}/k.service")
+        on = save(rv.NOTIFY_UNIT)
+        self.assertEqual(on.count(f"OnFailure={rv.NOTIFY_UNIT}"), 1)
+        self.assertTrue(os.path.exists(f"{rv.UNITS}/reveille-notify@.service"))
+        off = save("")
+        self.assertNotIn("OnFailure", off)
+        for text in (on, off):                          # ExecStart= with its odd spacing, the comment and ExecCondition= stay
+            for line in ("ExecStart=/usr/bin/true  --flag   'a  b'", "# my note", "ExecCondition=/usr/bin/test -d /tmp"):
+                self.assertIn(line, text)
+
+    def test_switching_to_a_service_replaces_the_notification(self):
+        t = task(adv=adv(fail=rv.NOTIFY_UNIT)); self.assertIsNone(rv.apply_task(t))
+        self.assertIsNone(rv.apply_task({**t, "old_name": t["name"], "keep_exec": True, "adv": adv(fail="other.service")}))
+        svc = read(f"{rv.UNITS}/{t['unit']}.service")
+        self.assertIn("OnFailure=other.service", svc); self.assertNotIn(rv.NOTIFY_UNIT, svc); self.assertEqual(svc.count("OnFailure="), 1)
+
+    def test_the_loop_check_does_not_trip_on_it(self):
+        t = task(adv=adv(fail=rv.NOTIFY_UNIT)); self.assertIsNone(rv.apply_task(t))
+        self.assertFalse(rv.then_cycle(f"{t['unit']}.service", rv.NOTIFY_UNIT))
+        # but a service that fails into this task, which fails into the notification, is still a loop through this task
+        write("back.service", SIMPLE_SERVICE.replace("[Service]", f"OnFailure={t['unit']}.service\n[Service]"))
+        self.assertTrue(rv.then_cycle(f"{t['unit']}.service", "back.service"))
 
 
 class FilterTasks(unittest.TestCase):

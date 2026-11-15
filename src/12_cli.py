@@ -87,7 +87,8 @@ def cmd_new(a):
     if not err and cal and bad_calendar(cal): err = f"systemd rejected the schedule {cal!r}"
     if err: print(err, file=sys.stderr); return 1
     t = {"name": a.name, "kind": "command", "command": a.command, "trigger": {**DEFAULT_TR, **tr}, "catchup": True,
-         "enabled": not a.disabled, "adv": {"wake": a.wake, "condition": a.only_if or "", "after": a.after or ""}}
+         "enabled": not a.disabled, "adv": {"wake": a.wake, "condition": a.only_if or "", "after": a.after or "",
+                                         "fail": NOTIFY_UNIT if a.notify else ""}}
     try:
         t["unit"] = unique_base(a.name)
         if a.dry_run:                                   # show exactly what would be written, write nothing
@@ -163,6 +164,7 @@ def build_parser():
     nw.add_argument("--days", metavar="DAYS", help="with --at: only these days (Mon,Wed or Mon..Fri)")
     nw.add_argument("--only-if", metavar="CMD", help="run only if this command succeeds (ExecCondition=); exit 1 to 254 skips the run quietly")
     nw.add_argument("--after", metavar="CMD", help="run this command when the task has finished, including after a failure or a run skipped by --only-if (ExecStopPost=)")
+    nw.add_argument("--notify", action="store_true", help="show a desktop notification if the task fails (OnFailure=; needs notify-send)")
     nw.add_argument("--disabled", action="store_true", help="create the timer switched off")
     nw.add_argument("--wake", action="store_true", help="wake the computer from suspend when the timer is due (WakeSystem=true)")
     nw.add_argument("--dry-run", action="store_true", help="print the unit files that would be written and change nothing")

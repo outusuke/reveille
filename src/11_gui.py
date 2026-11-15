@@ -154,16 +154,23 @@ def gui():
                 row.set_selected(sel + 1 if cur else 0)
                 return row, [""] + items
             self.then, self.then_opts = picker("Then run", "A service to start after this one succeeds", adv.get("then", ""))
+            # The notification is its own switch; the picker is for other services. Only one OnFailure= is written, so
+            # each is greyed out while the other is in use (nothing is dropped without being seen).
+            was_notify = adv.get("fail") == NOTIFY_UNIT
+            self.notify_sw = Adw.SwitchRow(title="Notify me if it fails", active=was_notify)
+            self.notify_sw.set_tooltip_text("Shows a desktop notification naming the task (needs notify-send)")
             self.fail, self.fail_opts = picker("If it fails, run",
-                                               "A service to start when this one fails (after the last retry, if any); "
-                                               f"{NOTIFY_UNIT} shows a notification",
-                                               adv.get("fail", ""), (NOTIFY_UNIT,))
+                                               "A service to start when this one fails (after the last retry, if any)",
+                                               "" if was_notify else adv.get("fail", ""))
+            self.fail_row_subtitle = self.fail.get_subtitle()
+            self.notify_sw.connect("notify::active", self.sync_fail); self.fail.connect("notify::selected", self.sync_fail)
+            self.sync_fail()
             if sd is not None and sd < 244:
                 self.retries.set_sensitive(False); self.retries.set_subtitle(f"Needs systemd 244 or newer (this is {sd})")
             if sd is not None and sd < 249:
                 self.then.set_sensitive(False); self.then.set_subtitle(f"Needs systemd 249 or newer (this is {sd})")
             self.own_only = [self.cwd, self.env, self.timeout, self.ac, self.online, self.retries, self.retry_wait,
-                             self.low, self.path, self.cond, self.after, self.then, self.fail]   # don't apply to an existing service
+                             self.low, self.path, self.cond, self.after, self.then, self.notify_sw, self.fail]   # don't apply to an existing service
             for r in self.own_only + [self.delay, self.wake]: g.add(r)
 
             # Delete lives inside the item: a task's timer, or a service without a timer opened via its row
@@ -195,6 +202,15 @@ def gui():
                     "unit": list(INTERVAL_UNITS)[self.unit.get_selected()],
                     "times": parse_times(self.times.get_text()) or [], "login_sec": self.login_sec,
                     "first_sec": self.first_span()[1], "first_key": self.first_key}
+
+        def sync_fail(self, *_):
+            """The switch and the picker both set OnFailure=, which can only hold one unit: grey out the other."""
+            picked = self.fail.get_selected() != 0
+            self.fail.set_sensitive(not self.notify_sw.get_active())
+            self.fail.set_subtitle("Turn off \"Notify me if it fails\" to choose a service" if self.notify_sw.get_active()
+                                   else self.fail_row_subtitle)
+            self.notify_sw.set_sensitive(self.notify_sw.get_active() or not picked)
+            self.notify_sw.set_subtitle("Choose None in \"If it fails, run\" to use this" if picked and not self.notify_sw.get_active() else "")
 
         def first_span(self):
             """(valid, seconds or None) for the "First run" box: empty means the same as the interval."""
@@ -267,7 +283,7 @@ def gui():
                          "low": self.low.get_active(), "path": self.path.get_text().strip(),
                          "condition": self.cond.get_text().strip(), "after": self.after.get_text().strip(),
                          "then": self.then_opts[self.then.get_selected()],
-                         "fail": self.fail_opts[self.fail.get_selected()]}}
+                         "fail": NOTIFY_UNIT if self.notify_sw.get_active() else self.fail_opts[self.fail.get_selected()]}}
             if k == 0:
                 if not self.app_ids: return self.win.toast("No applications found")
                 t["app"] = self.app_ids[self.app.get_selected()]
