@@ -835,6 +835,16 @@ class SaveRollback(Base):
         self.assertEqual(read(path), before)
 
 
+class DeleteStops(Base):
+    def test_deleting_a_task_stops_its_service(self):
+        t = task(); self.assertIsNone(rv.apply_task(t))
+        CALLS.clear()
+        rv.remove_units([f"{t['unit']}.timer", f"{t['unit']}.service"])
+        self.assertIn(("stop", f"{t['unit']}.service"), CALLS)
+        self.assertIn(("reset-failed", f"{t['unit']}.service"), CALLS)
+        self.assertLess(CALLS.index(("disable", "--now", f"{t['unit']}.timer")), CALLS.index(("stop", f"{t['unit']}.service")))
+
+
 class UniqueBase(Base):
     def test_given_set_is_not_refetched_and_grows(self):
         taken = set()

@@ -105,6 +105,8 @@ def remove_units(names):
         if n.endswith(".timer"):
             if unit_status(n)[1]: snap["enable"].append(n)
             ctl("disable", "--now", n)
+        elif n.endswith(".service"):            # a deleted task must not keep running, or linger as "failed"
+            ctl("stop", n); ctl("reset-failed", n)
         try:
             if os.path.islink(p):
                 snap["items"].append(("link", p, os.readlink(p)))
