@@ -18,6 +18,11 @@ def pick_list(items, current):
     return items, 0
 
 
+def task_matches(query, *texts):
+    """True if every word of `query` appears (ignoring case) in the texts of a row: name, schedule, status."""
+    hay = " ".join(texts).lower()
+    return all(w in hay for w in query.lower().split())
+
 def sh(*cmd, timeout=10):
     """Run a program; None if it is missing or too slow."""
     try: return subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)

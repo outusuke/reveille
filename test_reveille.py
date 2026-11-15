@@ -1009,6 +1009,13 @@ class NotifyOnFailure(Base):
         self.assertFalse(os.path.exists(f"{rv.UNITS}/reveille-notify@.service"))
 
 
+class FilterTasks(unittest.TestCase):
+    def test_every_word_must_match_in_any_order_ignoring_case(self):
+        row = ("Nightly Backup", "Every day at 03:00\nNext: tomorrow 03:00\nLast: yesterday 03:00 failed (1)")
+        for q in ("", "backup", "BACKUP nightly", "03:00 failed", "  every  "): self.assertTrue(rv.task_matches(q, *row), q)
+        for q in ("backups", "backup weekly", "ok"): self.assertFalse(rv.task_matches(q, *row), q)
+
+
 class UniqueBase(Base):
     def test_given_set_is_not_refetched_and_grows(self):
         taken = set()

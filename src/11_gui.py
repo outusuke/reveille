@@ -499,8 +499,12 @@ def gui():
             self.free_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE); self.free_list.add_css_class("boxed-list")
             self.h1 = Gtk.Label(label="Scheduled", xalign=0); self.h1.add_css_class("heading")
             self.h2 = Gtk.Label(label="Services without a schedule", xalign=0); self.h2.add_css_class("heading")
+            self.query = ""                                 # the filter box appears once the list is long enough to need it
+            self.search = Gtk.SearchEntry(placeholder_text="Filter tasks", visible=False)
+            self.search.connect("search-changed", self.on_search)
+            for lst in (self.list, self.free_list): lst.set_filter_func(self.row_visible)
             body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-            for w in (self.h1, self.list, self.h2, self.free_list): body.append(w)
+            for w in (self.search, self.h1, self.list, self.h2, self.free_list): body.append(w)
             clamp = Adw.Clamp(maximum_size=640, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12,
                               child=body)
             self.stack.add_named(Gtk.Spinner(spinning=True, width_request=32, height_request=32,
@@ -514,6 +518,13 @@ def gui():
             self.stack.set_visible_child_name("loading")
             self.fill()
             GLib.timeout_add_seconds(30, lambda: (self.fill(), True)[1])
+
+        def row_visible(self, row):
+            return task_matches(self.query, row.get_title(), row.get_subtitle())
+
+        def on_search(self, entry):
+            self.query = entry.get_text()
+            for lst in (self.list, self.free_list): lst.invalidate_filter()
 
         def update_menu(self):
             m = Gio.Menu()
@@ -722,6 +733,7 @@ def gui():
                     self.h2.set_visible(bool(free)); self.free_list.set_visible(bool(free))
                     for m in tasks: self.list.append(self.task_row(m))
                     for sv in free: self.free_list.append(self.free_row(sv))
+                    self.search.set_visible(len(tasks) + len(free) >= 6)
                 for m in tasks: self.paint(m)
             elif self.shape is None:                          # first load failed: don't spin forever
                 self.stack.set_visible_child_name("empty")
