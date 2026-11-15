@@ -1975,6 +1975,30 @@ def cmd_run(name):
     print(f"Could not start {service}: {err}" if err else f"Started {service}", file=sys.stderr if err else sys.stdout)
     return 1 if err else 0
 
+def find_task(name, data):
+    """The task a name refers to (unit name, timer, service or display name). Returns (task, None) or (None, error text)."""
+    key = name.lower()
+    for m in data["tasks"]:
+        if key in (m["unit"].lower(), m["timer"].lower(), m["name"].lower(), m["service"].lower()): return m, None
+    return None, f"No task named {name!r}. Try: reveille list"
+
+def cmd_switch(name, on):
+    """Turn a task's timer on or off, as the switch in the window does."""
+    m, err = find_task(name, gather())
+    if not err: err = set_timer(m["timer"], on)
+    if err: print(err, file=sys.stderr); return 1
+    print(f"{'Enabled' if on else 'Disabled'} {m['timer']}")
+    return 0
+
+def cmd_logs(name, lines):
+    """Print the last lines of a task's (or a service's) journal."""
+    service, err = find_runnable(name, gather())
+    text = ""
+    if not err: text, err = read_log(service, lines)
+    if err: print(err, file=sys.stderr); return 1
+    print(text)
+    return 0
+
 def cmd_import_cron(path, apply, disabled):
     """Preview, or with --apply create, tasks from a crontab. The crontab itself is never changed."""
     text, err = read_crontab(path)
@@ -2022,6 +2046,11 @@ def build_parser():
     ls.add_argument("--json", action="store_true", help="print machine-readable JSON instead")
     r = sub.add_parser("run", help="run a task or service now")
     r.add_argument("name", help="task name or unit name, as shown by 'list'")
+    for word, text in (("enable", "turn a task's timer on"), ("disable", "turn a task's timer off")):
+        sub.add_parser(word, help=text).add_argument("name", help="task name or unit name, as shown by 'list'")
+    lg = sub.add_parser("logs", help="print the last lines of a task's journal")
+    lg.add_argument("name", help="task name or unit name, as shown by 'list'")
+    lg.add_argument("-n", "--lines", type=int, default=200, metavar="N", help="how many lines (default 200)")
     c = sub.add_parser("import-cron", help="turn crontab entries into tasks (preview unless --apply)")
     c.add_argument("--file", metavar="FILE", help="read this crontab file instead of 'crontab -l' (- for standard input)")
     c.add_argument("--apply", action="store_true", help="create the tasks (the default only shows what would happen)")
@@ -2033,6 +2062,8 @@ def main(argv=None):
     if args.cmd == "services": return cmd_services()
     if args.cmd == "list": return cmd_list(args.json)
     if args.cmd == "run": return cmd_run(args.name)
+    if args.cmd in ("enable", "disable"): return cmd_switch(args.name, args.cmd == "enable")
+    if args.cmd == "logs": return cmd_logs(args.name, args.lines)
     if args.cmd == "import-cron": return cmd_import_cron(args.file, args.apply, args.disabled)
     if args.cmd in ("install", "uninstall"): return cmd_menu(args.cmd == "install")
     return cmd_gui()

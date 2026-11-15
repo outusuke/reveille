@@ -758,6 +758,38 @@ class CommandLine(Base):
             else: sys.modules["gi"] = old
         self.assertEqual(code, 1); self.assertIn("PyGObject", err); self.assertIn("--help", err)
 
+    def fake_data(self):
+        m = {"unit": "nightly", "name": "Nightly", "timer": "nightly.timer", "service": "nightly.service"}
+        rv.gather = lambda: {"tasks": [m], "free": []}
+
+    def test_enable_and_disable(self):
+        self.fake_data(); seen = []; old = rv.set_timer
+        rv.set_timer = lambda t, on: seen.append((t, on)) or None
+        try:
+            self.assertEqual(self.run_main("enable", "Nightly")[:2], (0, "Enabled nightly.timer\n"))
+            self.assertEqual(self.run_main("disable", "nightly")[:2], (0, "Disabled nightly.timer\n"))
+            code, _, err = self.run_main("enable", "nope")
+        finally: rv.set_timer = old
+        self.assertEqual(seen, [("nightly.timer", True), ("nightly.timer", False)])
+        self.assertEqual(code, 1); self.assertIn("No task named", err)
+
+    def test_enable_reports_systemd_error(self):
+        self.fake_data(); old = rv.set_timer; rv.set_timer = lambda t, on: "refused"
+        try: code, _, err = self.run_main("enable", "nightly")
+        finally: rv.set_timer = old
+        self.assertEqual((code, err), (1, "refused\n"))
+
+    def test_logs(self):
+        self.fake_data(); got = []; old = rv.read_log
+        rv.read_log = lambda svc, n=200: got.append((svc, n)) or ("line one", None)
+        try:
+            code, out, _ = self.run_main("logs", "nightly", "-n", "5")
+            self.run_main("logs", "nightly")
+        finally: rv.read_log = old
+        self.assertEqual((code, out), (0, "line one\n"))
+        self.assertEqual(got, [("nightly.service", 5), ("nightly.service", 200)])
+        self.assertEqual(self.run_main("logs", "nope")[0], 1)
+
     def test_list_json(self):
         import json
         rv.gather = lambda: {"tasks": [], "free": []}
